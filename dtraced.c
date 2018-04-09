@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2016 (holder)
+ * Copyright (c) 2018 (Graeme Jenkinson)
  * All rights reserved.
  *
  * This software was developed by BAE Systems, the University of Cambridge
@@ -30,27 +30,19 @@
  *
  */
 
-#include <sys/dtrace.h>
+#include <sys/types.h>
 
-#include <errno.h>
-#include <dtrace.h>
 #include <dt_impl.h>
-#include <dt_printf.h>
+#include <errno.h>
+#include <libgen.h>
+#include <stdlib.h>
+#include <string.h>
 #include <signal.h>
-#include <stdio.h>
-#include <syslog.h>
 #include <unistd.h>
-
-#include <libxo/xo.h>
 #include <librdkafka/rdkafka.h>
 
-#include "ddtrace.h"
-
-/* FreeBSD does not provide the #define HOST_NAME_MAX (and is, in this regard,
- * not POSIX compliant). The maximum hostname length can be read as
- * sysconf(_SC_HOST_NAME_MAX).
- */
-#define HOST_NAME_MAX	MAXHOSTNAMELEN
+static void dt_log_put_buf(dtrace_hdl_t *, dtrace_bufdesc_t *b);
+static int dt_log_get_buf(dtrace_hdl_t *, int, dtrace_bufdesc_t **);
 
 #define	BUFDUMPHDR(hdr) \
 	(void) printf("%s: %s%s\n", g_pname, hdr, strlen(hdr) > 0 ? ":" : "");
@@ -84,22 +76,30 @@
 	(void) printf("%s: %20s => %s\n", g_pname, #field, \
 	    (ptr)->field != NULL ? "<non-NULL>" : "<NULL>");
 
-static const char * const NODE_JSON_NAME = "node";
-static const char * const EVENT_JSON_NAME = "event";
-static const char * const PROBE_JSON_NAME = "probe";
+
+char *g_pname;
+static int run = 1;
 static int g_status = 0;
 static int g_intr;
 static dtrace_hdl_t * g_dtp;
-static rd_kafka_t *rk;
-extern char * g_pname;
 
-static int	 bufhandler(const dtrace_bufdata_t *, void *);
-static void 	 dfatal(const char *fmt, ...);
-static void 	 msg_delivered(rd_kafka_t *, const rd_kafka_message_t *,
-    void *);
-static void 	 xo_ddt_close(void *);
-static int 	 xo_ddt_flush(void *);
-static int  	 xo_ddt_write(void *, const char *);
+static void	usage(FILE *);
+static void 	stop(int);
+
+/*ARGSUSED*/
+static void
+stop(int sig)
+{
+
+	run = 0;
+}
+
+static void 
+usage(FILE * fp)
+{
+
+	(void) fprintf(fp, "Usage: %s -b brokers -i input_topic\n", g_pname);
+}
 
 /*ARGSUSED*/
 static void
@@ -114,19 +114,26 @@ static int
 chew(const dtrace_probedata_t *data, void *arg)
 {
 	dtrace_probedesc_t *pd = data->dtpda_pdesc;
+	dtrace_eprobedesc_t *ed = data->dtpda_edesc;
 	processorid_t cpu = data->dtpda_cpu;
-	static int heading;
+
+	fprintf(stdout, "dtpd->id = %u\n", pd->dtpd_id);
+	fprintf(stdout, "dtepd->id = %u\n", ed->dtepd_epid);
+	fprintf(stdout, "dtpd->func = %s\n", pd->dtpd_func);
+	fprintf(stdout, "dtpd->name = %s\n", pd->dtpd_name);
+
+/*	static int heading;
 	char hostname[HOST_NAME_MAX + 1];
 	rd_kafka_topic_t *rkt = (rd_kafka_topic_t *) arg;
 
-	/* Open new libxo handle */
+	/* Open new libxo handle 
 	if (!(g_dtp->dt_xo_hdl = xo_create(XO_STYLE_JSON, XOF_WARN|XOF_DTRT))) {
 		dfatal("failure creating libxo handle\n");
 	}
 	xo_set_writer(g_dtp->dt_xo_hdl, rkt, xo_ddt_write, xo_ddt_close,
 		xo_ddt_flush);
 	
-        /* Serialise the probe description as JSON. */	
+        /* Serialise the probe description as JSON. *
 	gethostname(hostname, HOST_NAME_MAX);
 	xo_open_container_h(g_dtp->dt_xo_hdl, NODE_JSON_NAME);
 	xo_emit_h(g_dtp->dt_xo_hdl, "{:hostname/%s}", hostname);
@@ -137,7 +144,7 @@ chew(const dtrace_probedata_t *data, void *arg)
 	    data->dtpda_timestamp, cpu, pd->dtpd_id, pd->dtpd_func,
 	    pd->dtpd_name);
 	xo_close_container_hd(g_dtp->dt_xo_hdl);
-
+*/
 	return (DTRACE_CONSUME_THIS);
 }
 	
@@ -151,12 +158,21 @@ chewrec(const dtrace_probedata_t * data, const dtrace_recdesc_t * rec,
 
 	/* Check if the final record has been processed. */
 	if (rec == NULL) {
-		xo_finish_h(g_dtp->dt_xo_hdl);
-		xo_destroy(g_dtp->dt_xo_hdl);
-		g_dtp->dt_xo_hdl = NULL;
+		//xo_finish_h(g_dtp->dt_xo_hdl);
+		//xo_destroy(g_dtp->dt_xo_hdl);
+		//g_dtp->dt_xo_hdl = NULL;
 
 		return (DTRACE_CONSUME_NEXT); 
 	}
+
+	fprintf(stdout, "chewrec %p\n", rec);
+	fprintf(stdout, "dtrd_action %u\n", rec->dtrd_action);
+	fprintf(stdout, "dtrd_size %u\n", rec->dtrd_size);
+	fprintf(stdout, "dtrd_alignment %u\n", rec->dtrd_alignment);
+	fprintf(stdout, "dtrd_format %u\n", rec->dtrd_format);
+	fprintf(stdout, "dtrd_arg  %u\n", rec->dtrd_arg);
+	fprintf(stdout, "dtrd_uarg  %u\n", rec->dtrd_uarg);
+
 
 	act = rec->dtrd_action;
 	addr = (uintptr_t)data->dtpda_data;
@@ -325,72 +341,106 @@ dfatal(const char *fmt, ...)
         exit(EXIT_FAILURE);
 }
 
-/*ARGSUSED*/
-static void
-msg_delivered(rd_kafka_t * rk, const rd_kafka_message_t * rkmessage,
-    void * opaque)
-{
-	if (rkmessage->err) {
-		fprintf(stderr, "%s: message delivery failed: %s\n",
-		    g_pname, rd_kafka_message_errstr(rkmessage));
-	} else {
-		fprintf(stdout, "%s: message delivered (%zd bytes)\n",
-		    g_pname, rkmessage->len);
-	}
-}
-
-static void
-xo_ddt_close(void * arg)
-{
-
-}
-
-/*ARGSUSED*/
-static int
-xo_ddt_flush(void * arg)
-{
-
-	return (0);
-}
-
-static int
-xo_ddt_write(void * arg, const char * buf)
-{
-	int partition = RD_KAFKA_PARTITION_UA;
-	rd_kafka_topic_t * rkt = (rd_kafka_topic_t *) arg;
-
-	if (rd_kafka_produce(rkt, partition, RD_KAFKA_MSG_F_COPY,
-		(void *) buf, strlen(buf), NULL, 0, NULL) == -1) {
-		fprintf(stderr, "%s: failed to produce to topic %s "
-		    "partition %i: %s\n", g_pname, rd_kafka_topic_name(rkt),
-		    partition, rd_kafka_err2str(rd_kafka_errno2err(errno)));
-
-		rd_kafka_poll(rk, 0);
-		return (-1);
-	}
-
-	fprintf(stdout, "%s: sent %zd bytes to topic %s partition %i\n",
-	    g_pname, strlen(buf), rd_kafka_topic_name(rkt), partition);
-
-	rd_kafka_poll(rk, 0);
-
-	return (0);
-}
+rd_kafka_t * rk;
+rd_kafka_topic_t * rkt;
 
 /*
- * Compile and instrument using dtrace. 
- * Custome dtrace consumeer that serailises probe and records as JSON. The
- * JSON records are then written back to the specified Kafak topic.
+ * Prototype distributed dtrace agent.
+ * The agent reveices D-Language scripts from a Apache Kafka topic. For each
+ * script a new processes is forked. The process compiles the D-Language script
+ * and sends the resulting DOF file to the kernel for execution. Results are
+ * returned through another Apache Kafka topic.
  */
 int
-ddtrace(ddtrace_script_t script, ddtrace_broker_spec_t brokers,
-    ddtrace_topic_t topic)
+main(int argc, char *argv[])
 {
 	rd_kafka_conf_t * conf;
 	rd_kafka_topic_conf_t * topic_conf;
-	rd_kafka_topic_t *rkt; /* Kafka topic that response is written to */
+	rd_kafka_message_t ** rkmessages = NULL;
+	int64_t start_offset = RD_KAFKA_OFFSET_BEGINNING;
+	int c;
+	int partition = 0;
+	int pid;
 	int err;
 	char errstr[512];
+	char * brokers;
+	char * topic;
+	char * output_topic;
+	char * script = "tick-1sec{ print(\"hello\"); }";
+
+	g_pname = basename(argv[0]); 	
+
+	if (argc == 1) {
+		usage(stderr);
+		exit(EXIT_FAILURE);
+	}
+
+	opterr = 0;
+	while ((c = getopt(argc, argv, "b:i:")) != -1) {
+		switch(c) {
+		case 'b':
+			brokers = optarg;
+			break;
+		case 'i':
+			topic = optarg;
+			break;
+		case '?':
+		default:
+			usage(stderr);
+			exit(EXIT_FAILURE);
+		}
+	}
+
+	if (brokers == NULL || topic == NULL ) {
+		usage(stderr);
+		exit(EXIT_FAILURE);
+	}
+
+	signal(SIGINT, stop);
+
+	/*
+	 * Setup the Kafka topic used for receiving receiving D-Langauge
+	 * instrumentation scripts
+	 */
+	conf = rd_kafka_conf_new();
+
+	topic_conf = rd_kafka_topic_conf_new();
+
+	if (!(rk = rd_kafka_new(RD_KAFKA_CONSUMER, conf, errstr,
+	    sizeof(errstr)))) {
+		fprintf(stderr, "%s: failed to create Kafka consumer: %s\n",
+		    g_pname, errstr);
+		exit(EXIT_FAILURE);
+	}
+
+	if (rd_kafka_brokers_add(rk, brokers) < 1) {
+		fprintf(stderr, "%s: no valid brokers specified\n", g_pname);
+		exit(EXIT_FAILURE);
+	}
+
+	if (!(rkt = rd_kafka_topic_new(rk, topic, topic_conf))) {
+		fprintf(stderr, "%s: failed to create Kafka topic %s\n",
+		    g_pname, topic);
+		exit(EXIT_FAILURE);
+	}
+
+	if (rd_kafka_consume_start(rkt, partition, start_offset) == -1) {
+		fprintf(stderr, "%s: failed to start consuming: %s\n",
+		    g_pname, rd_kafka_err2str(rd_kafka_errno2err(errno)));
+		if (errno == EINVAL) {
+	        	fprintf(stderr, "%s: broker based offset storage "
+			    "requires a group.id, "
+			    "add: -X group.id=yourGroup\n", g_pname);
+		}
+		exit(EXIT_FAILURE);
+	}
+	
+	dtrace_consumer_t con;
+
+	con.dc_consume_probe = chew;
+	con.dc_consume_rec = chewrec;
+	con.dc_put_buf = dt_log_put_buf;
+	con.dc_get_buf = dt_log_get_buf;
 
 	if ((g_dtp = dtrace_open(DTRACE_VERSION, 0, &err)) == NULL) {
 		fprintf(stderr, "%s failed to initialize dtrace: %s\n",
@@ -399,7 +449,7 @@ ddtrace(ddtrace_script_t script, ddtrace_broker_spec_t brokers,
 	}
 	fprintf(stdout, "%s: dtrace initialized\n", g_pname);
 
-	(void) dtrace_setopt(g_dtp, "oformat", "json");
+	//(void) dtrace_setopt(g_dtp, "oformat", "json");
 	(void) dtrace_setopt(g_dtp, "bufsize", "4m");
 	(void) dtrace_setopt(g_dtp, "aggsize", "4m");
 	(void) dtrace_setopt(g_dtp, "temporal", "4m");
@@ -430,31 +480,6 @@ ddtrace(ddtrace_script_t script, ddtrace_broker_spec_t brokers,
 	}
 	fprintf(stdout, "%s: dtrace instrumentation started...\n", g_pname);
  
-	if (dtrace_handle_buffered(g_dtp, &bufhandler, NULL) == -1) {
-		dfatal("failed to establish buffered handler\n");
-	}
-
-	/* Create a Kafka handle */
-	if (!(conf = rd_kafka_conf_new())) {
-		dfatal("failure creating kafka conf\n");
-	}
-	rd_kafka_conf_set_dr_msg_cb(conf, msg_delivered);
-
-	if (!(rk = rd_kafka_new(RD_KAFKA_PRODUCER, conf, errstr,
-	    sizeof(errstr)))) {
-		/* Destroy the Kafka topic */
-		rd_kafka_destroy(rk);
-		dfatal("failed to create new producer: %s\n", errstr);
-	}
-	rd_kafka_set_log_level(rk, LOG_DEBUG);
-
-	if (rd_kafka_brokers_add(rk, brokers) == 0) {
-		rd_kafka_destroy(rk);
-		dfatal("no valid brokers specified\n");
-	}
-	topic_conf = rd_kafka_topic_conf_new();
-	rkt = rd_kafka_topic_new(rk, topic, topic_conf);
-		   
 	int done = 0;
 	do {
 		if (!g_intr && !done) {
@@ -469,7 +494,7 @@ ddtrace(ddtrace_script_t script, ddtrace_broker_spec_t brokers,
 		}
 		
 
-		switch (dtrace_work(g_dtp, NULL, chew, chewrec, rkt)) {
+		switch (dtrace_work(g_dtp, stdout, &con, rkt)) {
 		case DTRACE_WORKSTATUS_DONE:
 			done = 1;
 			break;
@@ -485,16 +510,6 @@ ddtrace(ddtrace_script_t script, ddtrace_broker_spec_t brokers,
 		}
 
 	} while (!done);
-
-destroy_libxo:
-	/*
-	 * Destroy the libxo handle (this will only happen if we are in the
-	 * middle of processing a set of records).
-	 */
-	if (g_dtp->dt_xo_hdl != NULL) {
-		xo_finish_h(g_dtp->dt_xo_hdl);
-		xo_destroy(g_dtp->dt_xo_hdl);
-	}
 
 destroy_kafka:
 	/* Poll to handle delivery reports. */
@@ -520,3 +535,75 @@ destroy_dtrace:
 	return (0);
 }
 
+static void
+dt_log_put_buf(dtrace_hdl_t *dtp, dtrace_bufdesc_t *buf)
+{
+
+	fprintf(stdout, "%s: dt_log_put_buf\n", g_pname);
+	dt_free(dtp, buf->dtbd_data);
+	dt_free(dtp, buf);
+}
+
+static int
+dt_log_get_buf(dtrace_hdl_t *dtp, int cpu, dtrace_bufdesc_t **bufp)
+{
+	dtrace_optval_t size;
+	dtrace_bufdesc_t *buf;
+	rd_kafka_message_t * rkmessage;
+	rd_kafka_resp_err_t err;
+	rd_kafka_conf_t * conf;
+	rd_kafka_topic_conf_t * topic_conf;
+	rd_kafka_message_t ** rkmessages = NULL;
+	int64_t start_offset = RD_KAFKA_OFFSET_BEGINNING;
+	int c, error, partition = 0, pid;
+	char errstr[512];
+	char * brokers;
+	char * topic;
+	char * output_topic;
+
+	fprintf(stdout, "%s: dt_log_get_buf\n", g_pname);
+	buf = dt_zalloc(dtp, sizeof(*buf));
+	if (buf == NULL)
+		return -1;
+
+	(void) dtrace_getopt(dtp, "bufsize", &size);
+	buf->dtbd_data = dt_zalloc(dtp, size);
+	if (buf->dtbd_data == NULL) {
+		dt_free(dtp, buf);
+		return -1;
+	}
+	buf->dtbd_size = size;
+	buf->dtbd_cpu = cpu;
+
+	/* Non-blocking poll of the log. */
+	// TODO return values
+	rd_kafka_poll(rk ,0);
+	fprintf(stdout, "%s: dt_log_get_buf\n", g_pname);
+
+	rkmessage = rd_kafka_consume(rkt, partition, 1000);
+	if (rkmessage != NULL) {
+		if (!rkmessage->err && rkmessage->len > 0) {
+
+			fprintf(stdout, "%s: message in log %zu\n",
+			     g_pname, rkmessage->len);
+
+			// TODO how to stop consuming more that the buffer?
+			memcpy(buf->dtbd_data, rkmessage->payload,
+			    rkmessage->len);
+			write(1, rkmessage->payload, rkmessage->len);
+
+			// Don't think I need to do any of these things
+			//error = dt_unring_buf(dtp, buf);
+			//dt_realloc_buf(dtp, buf, size);
+			*bufp = buf;
+			return 0;
+		} else {
+			//dt_log_put_buf(dtp, buf);
+			*bufp = NULL;
+		}
+		//rd_kafka_message_destroy(rkmessage);
+	}
+	fprintf(stdout, "%s: No messages in log\n", g_pname);
+	*bufp = NULL;
+	return 0;
+}

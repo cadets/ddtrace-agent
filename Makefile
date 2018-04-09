@@ -10,8 +10,7 @@ all:
 	-I /usr/src/cddl/lib/libdtrace \
 	-I /usr/src/sys/cddl/compat/opensolaris \
 	-I /usr/src/sys/cddl/contrib/opensolaris/uts/common \
-	ddtrace_agent.c \
-        ddtrace.c \
+	dtraced.c \
 	-l dtrace -l proc -l ctf -l elf -l z -l rtld_db -l pthread -l util \
 	-l xo -lcrypto -lssl -l rdkafka \
-	-o ddtrace_agent -Wl,-rpath,/usr/local/lib 
+	-o dtraced -Wl,-rpath,/usr/local/lib 
