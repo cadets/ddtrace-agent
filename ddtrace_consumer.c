@@ -30,34 +30,27 @@
  *
  */
 
-#include <sys/types.h>
-#include <sys/nv.h>
-
 #include <dt_impl.h>
 #include <errno.h>
 #include <libgen.h>
+#include <librdkafka/rdkafka.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
 #include <unistd.h>
-#include <librdkafka/rdkafka.h>
 
-#include "dl_config.h"
-
-static void dt_log_put_buf(dtrace_hdl_t *, dtrace_bufdesc_t *b);
-static int dt_log_get_buf(dtrace_hdl_t *, int, dtrace_bufdesc_t **);
-static void usage(FILE *);
+static int dtc_get_buf(dtrace_hdl_t *, int, dtrace_bufdesc_t **);
+static void dtc_put_buf(dtrace_hdl_t *, dtrace_bufdesc_t *b);
 
 static char *g_pname;
 static int g_status = 0;
 static int g_intr;
-static dtrace_hdl_t * g_dtp;
 static rd_kafka_t *rk;
 static rd_kafka_topic_t *rkt;
 
 static inline void 
-usage(FILE * fp)
+dtc_usage(FILE * fp)
 {
 
 	(void) fprintf(fp,
@@ -66,7 +59,7 @@ usage(FILE * fp)
 
 /*ARGSUSED*/
 static inline void
-intr(int signo)
+dtc_intr(int signo)
 {
 
 	g_intr = 1;
@@ -121,52 +114,10 @@ chewrec(const dtrace_probedata_t * data, const dtrace_recdesc_t * rec,
 	return (DTRACE_CONSUME_THIS); 
 }
 
-/*PRINTFLIKE1*/
-static void
-dfatal(const char *fmt, ...)
-{
-#if !defined(illumos) && defined(NEED_ERRLOC)
-        char *p_errfile = NULL;
-        int errline = 0;
-#endif
-        va_list ap;
-
-        va_start(ap, fmt);
-
-        (void) fprintf(stderr, "%s: ", g_pname);
-        if (fmt != NULL)
-                (void) vfprintf(stderr, fmt, ap);
-
-        va_end(ap);
-
-        if (fmt != NULL && fmt[strlen(fmt) - 1] != '\n') {
-                (void) fprintf(stderr, ": %s\n",
-                    dtrace_errmsg(g_dtp, dtrace_errno(g_dtp)));
-        } else if (fmt == NULL) {
-                (void) fprintf(stderr, "%s\n",
-                    dtrace_errmsg(g_dtp, dtrace_errno(g_dtp)));
-        }
-#if !defined(illumos) && defined(NEED_ERRLOC)
-        dt_get_errloc(g_dtp, &p_errfile, &errline);
-        if (p_errfile != NULL)
-                printf("File '%s', line %d\n", p_errfile, errline);
-#endif
-
-        /*
-         * Close the DTrace handle to ensure that any controlled processes are
-         * correctly restored and continued.
-         */
-        dtrace_close(g_dtp);
-
-        exit(EXIT_FAILURE);
-}
-
 /*
  * Prototype distributed dtrace agent.
- * The agent reveices D-Language scripts from a Apache Kafka topic. For each
- * script a new processes is forked. The process compiles the D-Language script
- * and sends the resulting DOF file to the kernel for execution. Results are
- * returned through another Apache Kafka topic.
+ * The agent recieves DTrace records from an Apache Kafka topic and prints
+ * them using libdtrace.
  */
 int
 main(int argc, char *argv[])
@@ -174,25 +125,26 @@ main(int argc, char *argv[])
 	dtrace_consumer_t con;
 	dtrace_prog_t * prog;
 	dtrace_proginfo_t info;
+	dtrace_hdl_t *dtp;
 	FILE *fp;
 	rd_kafka_conf_t *conf;
 	rd_kafka_topic_conf_t *topic_conf;
 	int64_t start_offset = RD_KAFKA_OFFSET_BEGINNING;
-	int c, err, partition = 0, script_argc = 0;
-	char *brokers, *topic_name, *args;
+	int c, err, partition = 0, ret = 0, script_argc = 0;
+	char *args, *brokers, *topic_name;
 	char **script_argv;
 	char errstr[512];
 
 	g_pname = basename(argv[0]); 	
 
-	if (argc == 1) {
-		usage(stderr);
-		exit(EXIT_FAILURE);
-	}
-
-	script_argv = malloc(sizeof(char *) * argc);
+	/** Allocate space required for any arguments being passed to the
+	 *  D-language script.
+	 */
+	script_argv = (char **) malloc(sizeof(char *) * argc);
 	if (script_argv == NULL) {
 
+		fprintf(stderr, "%s: failed to create Kafka consumer: %s\n",
+		    g_pname, errstr);
 		exit(EXIT_FAILURE);
 	}
 
@@ -207,13 +159,17 @@ main(int argc, char *argv[])
 				topic_name = optarg;
 				break;
 			case 's':
-				if ((fp = fopen(optarg, "r")) == NULL)
-				    exit(EXIT_FAILURE);
+				if ((fp = fopen(optarg, "r")) == NULL) {
+
+					ret = -1;
+					goto free_script_args;
+				}
 				break;
 			case '?':
 			default:
-				usage(stderr);
-				exit(EXIT_FAILURE);
+				dtc_usage(stderr);
+				ret = -1;
+				goto free_script_args;
 			}
 		}
 
@@ -223,38 +179,51 @@ main(int argc, char *argv[])
 
 	if (brokers == NULL || topic_name == NULL || fp == NULL) {
 
-		free(script_argv);
-		usage(stderr);
-		exit(EXIT_FAILURE);
+		dtc_usage(stderr);
+		ret = -1;
+		goto free_script_args;
 	}
 
-	/*
-	 * Setup the Kafka topic used for receiving receiving D-Langauge
-	 * instrumentation scripts
-	 */
+	/* Setup the Kafka topic used for receiving DTrace records. */
 	conf = rd_kafka_conf_new();
+	if (conf == NULL) {
+
+		fprintf(stderr, "%s: failed to create Kafka consumer: %s\n",
+		    g_pname, errstr);
+		goto free_script_args;
+	}
 
 	topic_conf = rd_kafka_topic_conf_new();
+	if (topic_conf == NULL) {
+
+		fprintf(stderr, "%s: failed to create Kafka consumer: %s\n",
+		    g_pname, errstr);
+		goto free_script_args;
+	}
 
 	if (!(rk = rd_kafka_new(RD_KAFKA_CONSUMER, conf, errstr,
 	    sizeof(errstr)))) {
+
 		fprintf(stderr, "%s: failed to create Kafka consumer: %s\n",
 		    g_pname, errstr);
-		exit(EXIT_FAILURE);
+		goto free_script_args;
 	}
 
 	if (rd_kafka_brokers_add(rk, brokers) < 1) {
+
 		fprintf(stderr, "%s: no valid brokers specified\n", g_pname);
-		exit(EXIT_FAILURE);
+		goto destroy_kafka;
 	}
 
 	if (!(rkt = rd_kafka_topic_new(rk, topic_name, topic_conf))) {
+
 		fprintf(stderr, "%s: failed to create Kafka topic %s\n",
 		    g_pname, topic_name);
-		exit(EXIT_FAILURE);
+		goto destroy_kafka;
 	}
 
 	if (rd_kafka_consume_start(rkt, partition, start_offset) == -1) {
+
 		fprintf(stderr, "%s: failed to start consuming: %s\n",
 		    g_pname, rd_kafka_err2str(rd_kafka_errno2err(errno)));
 		if (errno == EINVAL) {
@@ -262,44 +231,49 @@ main(int argc, char *argv[])
 			    "requires a group.id, "
 			    "add: -X group.id=yourGroup\n", g_pname);
 		}
-		exit(EXIT_FAILURE);
+		goto destroy_kafka;
 	}
 	
 	con.dc_consume_probe = chew;
 	con.dc_consume_rec = chewrec;
-	con.dc_put_buf = dt_log_put_buf;
-	con.dc_get_buf = dt_log_get_buf;
+	con.dc_put_buf = dtc_put_buf;
+	con.dc_get_buf = dtc_get_buf;
 
-	if ((g_dtp = dtrace_open(DTRACE_VERSION, 0, &err)) == NULL) {
-		fprintf(stderr, "%s failed to initialize dtrace: %s\n",
-		    g_pname, dtrace_errmsg(g_dtp, err));
-		exit(EXIT_FAILURE);
+	if ((dtp = dtrace_open(DTRACE_VERSION, 0, &err)) == NULL) {
+
+		fprintf(stderr, "%s: failed to initialize dtrace %s",
+		    g_pname, dtrace_errmsg(dtp, dtrace_errno(dtp)));
+		goto destroy_kafka;
 	}
 	fprintf(stdout, "%s: dtrace initialized\n", g_pname);
 
-	(void) dtrace_setopt(g_dtp, "aggsize", "4m");
-	(void) dtrace_setopt(g_dtp, "bufsize", "4k");
-	(void) dtrace_setopt(g_dtp, "bufpolicy", "switch");
-	(void) dtrace_setopt(g_dtp, "destructive", 0);
+	(void) dtrace_setopt(dtp, "aggsize", "4m");
+	(void) dtrace_setopt(dtp, "bufsize", "4k");
+	(void) dtrace_setopt(dtp, "bufpolicy", "switch");
+	(void) dtrace_setopt(dtp, "destructive", 0);
 	printf("%s: dtrace options set\n", g_pname);
 
-	if ((prog = dtrace_program_fcompile(g_dtp, fp,
+	if ((prog = dtrace_program_fcompile(dtp, fp,
 	    DTRACE_C_PSPEC | DTRACE_C_CPP, script_argc, script_argv)) == NULL) {
-				fprintf(stderr, "%s",
-				    dtrace_errmsg(g_dtp, dtrace_errno(g_dtp)));
-		dfatal("failed to compile dtrace program\n");
+
+		fprintf(stderr, "%s: failed to compile dtrace program %s",
+		    g_pname, dtrace_errmsg(dtp, dtrace_errno(dtp)));
+		goto destroy_dtrace;
 	}
 	fprintf(stdout, "%s: dtrace program compiled\n", g_pname);
 	
-	if (dtrace_program_exec(g_dtp, prog, &info) == -1) {
-		dfatal("failed to enable dtrace probes\n");
+	if (dtrace_program_exec(dtp, prog, &info) == -1) {
+
+		fprintf(stderr, "%s: failed to enable dtrace probes %s",
+		    g_pname, dtrace_errmsg(dtp, dtrace_errno(dtp)));
+		goto destroy_dtrace;
 	}
 	fprintf(stdout, "%s: dtrace probes enabled\n", g_pname);
 
 	struct sigaction act;
 	(void) sigemptyset(&act.sa_mask);
 	act.sa_flags = 0;
-	act.sa_handler = intr;
+	act.sa_handler = dtc_intr;
 	(void) sigaction(SIGINT, &act, NULL);
 	(void) sigaction(SIGTERM, &act, NULL);
 
@@ -309,7 +283,7 @@ main(int argc, char *argv[])
 			done = 1;
 		}
 		
-		switch (dtrace_work_detached(g_dtp, stdout, &con, rkt)) {
+		switch (dtrace_work_detached(dtp, stdout, &con, rkt)) {
 		case DTRACE_WORKSTATUS_DONE:
 			done = 1;
 			break;
@@ -317,16 +291,15 @@ main(int argc, char *argv[])
 			break;
 		case DTRACE_WORKSTATUS_ERROR:
 		default:
-			if (dtrace_errno(g_dtp) != EINTR) 
-				fprintf(stderr, "%s",
-				    dtrace_errmsg(g_dtp, dtrace_errno(g_dtp)));
-				dfatal("processing aborted\n");
+			if (dtrace_errno(dtp) != EINTR) 
+				fprintf(stderr, "%s : %s", g_pname,
+				    dtrace_errmsg(dtp, dtrace_errno(dtp)));
+				done = 1;
 			break;
 		}
 
 	} while (!done);
 
-destroy_kafka:
 	/* Poll to handle delivery reports. */
 	rd_kafka_poll(rk, 0);
 
@@ -335,6 +308,12 @@ destroy_kafka:
 		rd_kafka_poll(rk, 100);
 	}
 
+destroy_dtrace:
+	/* Destroy dtrace the handle. */
+	fprintf(stdout, "%s: closing dtrace\n", g_pname);
+	dtrace_close(dtp);
+
+destroy_kafka:
 	/* Destroy the Kafka topic */
 	rd_kafka_topic_destroy(rkt);
 
@@ -342,24 +321,15 @@ destroy_kafka:
 	fprintf(stdout, "%s: destroy kafka handle\n", g_pname);
 	rd_kafka_destroy(rk);
 
-destroy_dtrace:
-	/* Destroy dtrace the handle. */
-	fprintf(stdout, "%s: closing dtrace\n", g_pname);
-	dtrace_close(g_dtp);
+free_script_args:	
+	/* Free the memory used to hold the script arguments. */	
+	free(script_argv);
 
-	return (0);
-}
-
-static void
-dt_log_put_buf(dtrace_hdl_t *dtp, dtrace_bufdesc_t *buf)
-{
-
-	dt_free(dtp, buf->dtbd_data);
-	dt_free(dtp, buf);
+	return ret;
 }
 
 static int
-dt_log_get_buf(dtrace_hdl_t *dtp, int cpu, dtrace_bufdesc_t **bufp)
+dtc_get_buf(dtrace_hdl_t *dtp, int cpu, dtrace_bufdesc_t **bufp)
 {
 	dtrace_optval_t size;
 	dtrace_bufdesc_t *buf;
@@ -424,4 +394,12 @@ dt_log_get_buf(dtrace_hdl_t *dtp, int cpu, dtrace_bufdesc_t **bufp)
 
 	*bufp = buf;
 	return 0;
+}
+
+static void
+dtc_put_buf(dtrace_hdl_t *dtp, dtrace_bufdesc_t *buf)
+{
+
+	dt_free(dtp, buf->dtbd_data);
+	dt_free(dtp, buf);
 }
