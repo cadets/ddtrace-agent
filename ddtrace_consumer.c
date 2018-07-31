@@ -172,13 +172,15 @@ int
 main(int argc, char *argv[])
 {
 	dtrace_consumer_t con;
+	dtrace_prog_t * prog;
+	dtrace_proginfo_t info;
 	FILE *fp;
 	rd_kafka_conf_t *conf;
 	rd_kafka_topic_conf_t *topic_conf;
 	int64_t start_offset = RD_KAFKA_OFFSET_BEGINNING;
-	char *brokers, *topic_name;
-	char *script = "tick-2sec { trace(1); } tick-1sec { printf(\"hello\"); }";
-	int c, err, partition = 0;
+	int c, err, partition = 0, script_argc = 0;
+	char *brokers, *topic_name, *args;
+	char **script_argv;
 	char errstr[512];
 
 	g_pname = basename(argv[0]); 	
@@ -188,27 +190,40 @@ main(int argc, char *argv[])
 		exit(EXIT_FAILURE);
 	}
 
+	script_argv = malloc(sizeof(char *) * argc);
+	if (script_argv == NULL) {
+
+		exit(EXIT_FAILURE);
+	}
+
 	opterr = 0;
-	while ((c = getopt(argc, argv, "b:t:s:")) != -1) {
-		switch(c) {
-		case 'b':
-			brokers = optarg;
-			break;
-		case 't':
-			topic_name = optarg;
-			break;
-		case 's':
-			if ((fp = fopen(optarg, "r")) == NULL)
-			    exit(EXIT_FAILURE);
-			break;
-		case '?':
-		default:
-			usage(stderr);
-			exit(EXIT_FAILURE);
+	for (optind = 0; optind < argc; optind++) {
+		while ((c = getopt(argc, argv, "b:t:s:")) != -1) {
+			switch(c) {
+			case 'b':
+				brokers = optarg;
+				break;
+			case 't':
+				topic_name = optarg;
+				break;
+			case 's':
+				if ((fp = fopen(optarg, "r")) == NULL)
+				    exit(EXIT_FAILURE);
+				break;
+			case '?':
+			default:
+				usage(stderr);
+				exit(EXIT_FAILURE);
+			}
 		}
+
+		if (optind < argc)
+			script_argv[script_argc++] = argv[optind];
 	}
 
 	if (brokers == NULL || topic_name == NULL || fp == NULL) {
+
+		free(script_argv);
 		usage(stderr);
 		exit(EXIT_FAILURE);
 	}
@@ -268,24 +283,14 @@ main(int argc, char *argv[])
 	(void) dtrace_setopt(g_dtp, "destructive", 0);
 	printf("%s: dtrace options set\n", g_pname);
 
-	dtrace_prog_t * prog;
-	char *newargs[] = {"g", "\"host\""};
 	if ((prog = dtrace_program_fcompile(g_dtp, fp,
-		DTRACE_C_PSPEC | DTRACE_C_CPP, 2, newargs)) == NULL) {
+	    DTRACE_C_PSPEC | DTRACE_C_CPP, script_argc, script_argv)) == NULL) {
 				fprintf(stderr, "%s",
 				    dtrace_errmsg(g_dtp, dtrace_errno(g_dtp)));
-		dfatal("failed to compile dtrace program: %s\n", script);
+		dfatal("failed to compile dtrace program\n");
 	}
 	fprintf(stdout, "%s: dtrace program compiled\n", g_pname);
-/*
-	dtrace_prog_t * prog;
-	if ((prog = dtrace_program_strcompile(g_dtp, script,
-		DTRACE_PROBESPEC_NAME, DTRACE_C_PSPEC, 0, NULL)) == NULL) {
-		dfatal("failed to compile dtrace program: %s\n", script);
-	}
-	fprintf(stdout, "%s: dtrace program compiled\n", g_pname);
-*/
-	dtrace_proginfo_t info;
+	
 	if (dtrace_program_exec(g_dtp, prog, &info) == -1) {
 		dfatal("failed to enable dtrace probes\n");
 	}

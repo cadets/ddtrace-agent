@@ -170,8 +170,9 @@ main(int argc, char *argv[])
 	char *topic_name;
 	char * script = "tick-2sec { trace(1); } tick-1sec { print(\"hello\"); }";
 	size_t packed_len;
-	int dlog, rc, c, err;
+	int dlog, rc, c, err, script_argc = 0;
 	char errstr[512], konarg[13];
+	char **script_argv;
 
 	g_pname = basename(argv[0]); 	
 
@@ -180,21 +181,28 @@ main(int argc, char *argv[])
 		exit(EXIT_FAILURE);
 	}
 
+	script_argv = malloc(sizeof(char *) * argc);
+
 	opterr = 0;
-	while ((c = getopt(argc, argv, "t:s:")) != -1) {
-		switch(c) {
-		case 't':
-			topic_name = optarg;
-			break;
-		case 's':
-			if ((fp = fopen(optarg, "r")) == NULL)
-			    exit(EXIT_FAILURE);
-			break;
-		case '?':
-		default:
-			usage(stderr);
-			exit(EXIT_FAILURE);
+	for (optind = 0; optind < argc; optind++) { 
+		while ((c = getopt(argc, argv, "t:s:")) != -1) {
+			switch(c) {
+			case 't':
+				topic_name = optarg;
+				break;
+			case 's':
+				if ((fp = fopen(optarg, "r")) == NULL)
+				    exit(EXIT_FAILURE);
+				break;
+			case '?':
+			default:
+				usage(stderr);
+				exit(EXIT_FAILURE);
+			}
 		}
+
+		if (optind < argc)
+			script_argv[script_argc++] = argv[optind]; 
 	}
 
 	if (topic_name == NULL || fp == NULL) {
@@ -262,23 +270,13 @@ main(int argc, char *argv[])
 	printf("%s: dtrace options set\n", g_pname);
 
 	dtrace_prog_t * prog;
-	char *newargs[] = {"g", "\"host\""};
-	if ((prog = dtrace_program_fcompile(g_dtp, fp,
-		DTRACE_C_PSPEC | DTRACE_C_CPP, 2, newargs)) == NULL) {
-		dfatal("failed to compile dtrace program: %s\n", script);
-	}
-	fprintf(stdout, "%s: dtrace program compiled\n", g_pname);
-
-/*
-	dtrace_prog_t * prog;
-	if ((prog = dtrace_program_strcompile(g_dtp, script,
-		DTRACE_PROBESPEC_NAME, DTRACE_C_PSPEC, 0, NULL)) == NULL) {
-		dfatal("failed to compile dtrace program: %s\n", script);
-	}
-	fprintf(stdout, "%s: dtrace program compiled\n", g_pname);
-*/
-
 	dtrace_proginfo_t info;
+	if ((prog = dtrace_program_fcompile(g_dtp, fp,
+	    DTRACE_C_PSPEC | DTRACE_C_CPP, script_argc, script_argv)) == NULL) {
+		dfatal("failed to compile dtrace program: %s\n", script);
+	}
+	fprintf(stdout, "%s: dtrace program compiled\n", g_pname);
+
 	if (dtrace_program_exec(g_dtp, prog, &info) == -1) {
 		dfatal("failed to enable dtrace probes\n");
 	}
