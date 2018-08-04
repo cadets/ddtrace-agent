@@ -73,10 +73,12 @@ chew(const dtrace_probedata_t *data, void *arg)
 	dtrace_eprobedesc_t *ed = data->dtpda_edesc;
 	processorid_t cpu = data->dtpda_cpu;
 
+#ifdef DEBUG
 	fprintf(stdout, "dtpd->id = %u\n", pd->dtpd_id);
 	fprintf(stdout, "dtepd->id = %u\n", ed->dtepd_epid);
 	fprintf(stdout, "dtpd->func = %s\n", pd->dtpd_func);
 	fprintf(stdout, "dtpd->name = %s\n", pd->dtpd_name);
+#endif
 
 	return (DTRACE_CONSUME_THIS);
 }
@@ -95,6 +97,7 @@ chewrec(const dtrace_probedata_t * data, const dtrace_recdesc_t * rec,
 		return (DTRACE_CONSUME_NEXT); 
 	}
 
+#ifdef DEBUG
 	fprintf(stdout, "chewrec %p\n", rec);
 	fprintf(stdout, "dtrd_action %u\n", rec->dtrd_action);
 	fprintf(stdout, "dtrd_size %u\n", rec->dtrd_size);
@@ -102,6 +105,7 @@ chewrec(const dtrace_probedata_t * data, const dtrace_recdesc_t * rec,
 	fprintf(stdout, "dtrd_format %u\n", rec->dtrd_format);
 	fprintf(stdout, "dtrd_arg  %lu\n", rec->dtrd_arg);
 	fprintf(stdout, "dtrd_uarg  %lu\n", rec->dtrd_uarg);
+#endif
 
 	act = rec->dtrd_action;
 	addr = (uintptr_t)data->dtpda_data;
@@ -143,8 +147,8 @@ main(int argc, char *argv[])
 	script_argv = (char **) malloc(sizeof(char *) * argc);
 	if (script_argv == NULL) {
 
-		fprintf(stderr, "%s: failed to create Kafka consumer: %s\n",
-		    g_pname, errstr);
+		fprintf(stderr, "%s: failed to allocate script arguments\n",
+		    g_pname);
 		exit(EXIT_FAILURE);
 	}
 
@@ -161,6 +165,9 @@ main(int argc, char *argv[])
 			case 's':
 				if ((fp = fopen(optarg, "r")) == NULL) {
 
+					fprintf(stderr,
+					    "%s: failed to open script file "
+					    "%s\n", optarg, g_pname);
 					ret = -1;
 					goto free_script_args;
 				}
@@ -188,16 +195,9 @@ main(int argc, char *argv[])
 	conf = rd_kafka_conf_new();
 	if (conf == NULL) {
 
-		fprintf(stderr, "%s: failed to create Kafka consumer: %s\n",
-		    g_pname, errstr);
-		goto free_script_args;
-	}
-
-	topic_conf = rd_kafka_topic_conf_new();
-	if (topic_conf == NULL) {
-
-		fprintf(stderr, "%s: failed to create Kafka consumer: %s\n",
-		    g_pname, errstr);
+		fprintf(stderr, "%s: failed to create Kafka conf: %s\n",
+		    g_pname, rd_kafka_err2str(rd_kafka_last_error()));
+		ret = -1;
 		goto free_script_args;
 	}
 
@@ -211,26 +211,40 @@ main(int argc, char *argv[])
 
 	if (rd_kafka_brokers_add(rk, brokers) < 1) {
 
-		fprintf(stderr, "%s: no valid brokers specified\n", g_pname);
+		fprintf(stderr, "%s: no valid brokers specified: %s\n",
+		    g_pname, rd_kafka_err2str(rd_kafka_last_error()));
+		ret = -1;
+		goto destroy_kafka;
+	}
+
+	topic_conf = rd_kafka_topic_conf_new();
+	if (topic_conf == NULL) {
+
+		fprintf(stderr, "%s: failed to start consuming: %s\n",
+		    g_pname, rd_kafka_err2str(rd_kafka_last_error()));
+		ret = -1;
 		goto destroy_kafka;
 	}
 
 	if (!(rkt = rd_kafka_topic_new(rk, topic_name, topic_conf))) {
 
-		fprintf(stderr, "%s: failed to create Kafka topic %s\n",
-		    g_pname, topic_name);
+		fprintf(stderr, "%s: failed to create Kafka topic %s: %s\n",
+		    g_pname, topic_name,
+		    rd_kafka_err2str(rd_kafka_last_error()));
+		ret = -1;
 		goto destroy_kafka;
 	}
 
 	if (rd_kafka_consume_start(rkt, partition, start_offset) == -1) {
 
 		fprintf(stderr, "%s: failed to start consuming: %s\n",
-		    g_pname, rd_kafka_err2str(rd_kafka_errno2err(errno)));
+		    g_pname, rd_kafka_err2str(rd_kafka_last_error()));
 		if (errno == EINVAL) {
 	        	fprintf(stderr, "%s: broker based offset storage "
 			    "requires a group.id, "
 			    "add: -X group.id=yourGroup\n", g_pname);
 		}
+		ret = -1;
 		goto destroy_kafka;
 	}
 	
@@ -243,6 +257,7 @@ main(int argc, char *argv[])
 
 		fprintf(stderr, "%s: failed to initialize dtrace %s",
 		    g_pname, dtrace_errmsg(dtp, dtrace_errno(dtp)));
+		ret = -1;
 		goto destroy_kafka;
 	}
 	fprintf(stdout, "%s: dtrace initialized\n", g_pname);
@@ -258,14 +273,18 @@ main(int argc, char *argv[])
 
 		fprintf(stderr, "%s: failed to compile dtrace program %s",
 		    g_pname, dtrace_errmsg(dtp, dtrace_errno(dtp)));
+		ret = -1;
 		goto destroy_dtrace;
 	}
 	fprintf(stdout, "%s: dtrace program compiled\n", g_pname);
+	
+	(void) fclose(fp);
 	
 	if (dtrace_program_exec(dtp, prog, &info) == -1) {
 
 		fprintf(stderr, "%s: failed to enable dtrace probes %s",
 		    g_pname, dtrace_errmsg(dtp, dtrace_errno(dtp)));
+		ret = -1;
 		goto destroy_dtrace;
 	}
 	fprintf(stdout, "%s: dtrace probes enabled\n", g_pname);

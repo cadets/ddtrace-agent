@@ -113,52 +113,8 @@ chewrec(const dtrace_probedata_t * data, const dtrace_recdesc_t * rec,
 	return (DTRACE_CONSUME_THIS); 
 }
 
-/*PRINTFLIKE1*/
-static void
-dfatal(const char *fmt, ...)
-{
-#if !defined(illumos) && defined(NEED_ERRLOC)
-        char *p_errfile = NULL;
-        int errline = 0;
-#endif
-        va_list ap;
-
-        va_start(ap, fmt);
-
-        (void) fprintf(stderr, "%s: ", g_pname);
-        if (fmt != NULL)
-                (void) vfprintf(stderr, fmt, ap);
-
-        va_end(ap);
-
-        if (fmt != NULL && fmt[strlen(fmt) - 1] != '\n') {
-                (void) fprintf(stderr, ": %s\n",
-                    dtrace_errmsg(g_dtp, dtrace_errno(g_dtp)));
-        } else if (fmt == NULL) {
-                (void) fprintf(stderr, "%s\n",
-                    dtrace_errmsg(g_dtp, dtrace_errno(g_dtp)));
-        }
-#if !defined(illumos) && defined(NEED_ERRLOC)
-        dt_get_errloc(g_dtp, &p_errfile, &errline);
-        if (p_errfile != NULL)
-                printf("File '%s', line %d\n", p_errfile, errline);
-#endif
-
-        /*
-         * Close the DTrace handle to ensure that any controlled processes are
-         * correctly restored and continued.
-         */
-        dtrace_close(g_dtp);
-
-        exit(EXIT_FAILURE);
-}
-
 /*
  * Prototype distributed dtrace agent.
- * The agent reveices D-Language scripts from a Apache Kafka topic. For each
- * script a new processes is forked. The process compiles the D-Language script
- * and sends the resulting DOF file to the kernel for execution. Results are
- * returned through another Apache Kafka topic.
  */
 int
 main(int argc, char *argv[])
@@ -168,20 +124,20 @@ main(int argc, char *argv[])
 	FILE *fp;
 	nvlist_t *props;
 	char *topic_name;
-	char * script = "tick-2sec { trace(1); } tick-1sec { print(\"hello\"); }";
 	size_t packed_len;
-	int dlog, rc, c, err, script_argc = 0;
-	char errstr[512], konarg[13];
+	int c, dlog, done = 0, err, ret = 0, rc, script_argc = 0;
+	char konarg[13];
 	char **script_argv;
 
 	g_pname = basename(argv[0]); 	
 
-	if (argc == 1) {
-		usage(stderr);
+	script_argv = malloc(sizeof(char *) * argc);
+	if (script_argv == NULL) {
+
+		fprintf(stderr, "%s: failed to allocate script arguments\n",
+		    g_pname);
 		exit(EXIT_FAILURE);
 	}
-
-	script_argv = malloc(sizeof(char *) * argc);
 
 	opterr = 0;
 	for (optind = 0; optind < argc; optind++) { 
@@ -191,13 +147,21 @@ main(int argc, char *argv[])
 				topic_name = optarg;
 				break;
 			case 's':
-				if ((fp = fopen(optarg, "r")) == NULL)
-				    exit(EXIT_FAILURE);
+				fp = fopen(optarg, "r");
+				if (fp == NULL) {
+
+					fprintf(stderr,
+					    "%s: failed to open script file "
+					    "%s\n", optarg, g_pname);
+					ret = -1;
+					goto free_script_args;
+				}
 				break;
 			case '?':
 			default:
 				usage(stderr);
-				exit(EXIT_FAILURE);
+				ret = -1;
+				goto free_script_args;
 			}
 		}
 
@@ -206,23 +170,29 @@ main(int argc, char *argv[])
 	}
 
 	if (topic_name == NULL || fp == NULL) {
+
 		usage(stderr);
-		exit(EXIT_FAILURE);
+		ret = -1;
+		goto free_script_args;
 	}
 
 	dlog = open("/dev/dlog", O_RDWR);
 	if (dlog == -1) {
+
 		fprintf(stderr, "%s failed to open dev dlog: %d\n",
 		    g_pname, errno);
-		exit(EXIT_FAILURE);
+		ret = -1;
+		(void) fclose(fp);
+		goto free_script_args;
 	}
 
 	props = nvlist_create(0);
 	if (props == NULL) {
+
 		fprintf(stderr, "%s failed to create nvlist : %d\n",
 		    g_pname, errno);
-		close(dlog);
-		exit(EXIT_FAILURE);
+		ret = -1;
+		goto close_dlog;
 	}
 
 	nvlist_add_string(props, DL_CONF_TOPIC, topic_name);
@@ -230,11 +200,11 @@ main(int argc, char *argv[])
 	client_conf = (struct dl_client_config_desc *) malloc(
 	    sizeof(struct dl_client_config_desc));
 	if (client_conf == NULL) {
+
 		fprintf(stderr, "%s failed to allocate client config: %d\n",
 		    g_pname, errno);
-		nvlist_destroy(props);
-		close(dlog);
-		exit(EXIT_FAILURE);
+		ret = -1;
+		goto destroy_nvlist;
 	}
 
 	client_conf->dlcc_packed_nvlist = nvlist_pack(props, &packed_len); 
@@ -242,29 +212,30 @@ main(int argc, char *argv[])
 
 	rc = ioctl(dlog, DLOGIOC_PRODUCER, &client_conf);	
 	if (rc != 0) {
-		fprintf(stderr, "%s failed to create producer: %d\n",
+
+		fprintf(stderr, "%s failed to create DLog producer: %d\n",
 		    g_pname, errno);
-		nvlist_destroy(props);
-		close(dlog);
-		exit(EXIT_FAILURE);
+		ret = -1;
+		goto destroy_nvlist;
 	}
 
-	con.dc_consume_probe = chew;
-	con.dc_consume_rec = chewrec;
+	con.dc_consume_probe = NULL; // ?chew;
+	con.dc_consume_rec = NULL; //chewrec;
 	con.dc_put_buf = NULL; 
 	con.dc_get_buf = NULL;
 
 	if ((g_dtp = dtrace_open(DTRACE_VERSION, 0, &err)) == NULL) {
+
 		fprintf(stderr, "%s failed to initialize dtrace: %s\n",
 		    g_pname, dtrace_errmsg(g_dtp, err));
-		exit(EXIT_FAILURE);
+		ret = -1;
+		goto destroy_dtrace;
 	}
 	fprintf(stdout, "%s: dtrace initialized\n", g_pname);
 
 	(void) dtrace_setopt(g_dtp, "aggsize", "4m");
 	(void) dtrace_setopt(g_dtp, "bufsize", "4k");
-	(void) dtrace_setopt(g_dtp, "bufpolicy", "ring");
-	//(void) dtrace_setopt(g_dtp, "bufpolicy", "disruptor");
+	(void) dtrace_setopt(g_dtp, "bufpolicy", "switch");
 	sprintf(konarg, "%d", dlog);
 	(void) dtrace_setopt(g_dtp, "konarg", konarg);
 	printf("%s: dtrace options set\n", g_pname);
@@ -273,12 +244,20 @@ main(int argc, char *argv[])
 	dtrace_proginfo_t info;
 	if ((prog = dtrace_program_fcompile(g_dtp, fp,
 	    DTRACE_C_PSPEC | DTRACE_C_CPP, script_argc, script_argv)) == NULL) {
-		dfatal("failed to compile dtrace program: %s\n", script);
+
+		fprintf(stderr, "%s: failed to compile dtrace program %s",
+		    g_pname, dtrace_errmsg(g_dtp, dtrace_errno(g_dtp)));
+		ret = -1;
+		goto destroy_dtrace;
+		
 	}
 	fprintf(stdout, "%s: dtrace program compiled\n", g_pname);
 
 	if (dtrace_program_exec(g_dtp, prog, &info) == -1) {
-		dfatal("failed to enable dtrace probes\n");
+
+		fprintf(stderr, "failed to enable dtrace probes\n");
+		ret = -1;
+		goto destroy_dtrace;
 	}
 	fprintf(stdout, "%s: dtrace probes enabled\n", g_pname);
 
@@ -290,11 +269,13 @@ main(int argc, char *argv[])
 	(void) sigaction(SIGTERM, &act, NULL);
 
 	if (dtrace_go(g_dtp) != 0) {
-		dfatal("could not start dtrace instrumentation\n");
+		
+		fprintf(stderr, "could not start dtrace instrumentation\n");
+		ret = -1;
+		goto destroy_dtrace;
 	}
 	fprintf(stdout, "%s: dtrace instrumentation started...\n", g_pname);
  
-	int done = 0;
 	do {
 		if (!g_intr && !done) {
 			dtrace_sleep(g_dtp);
@@ -303,39 +284,34 @@ main(int argc, char *argv[])
 		if (done || g_intr) {
 			done = 1;
 			if (dtrace_stop(g_dtp) == -1) {
-				dfatal("could not stop tracing\n");
+
+				fprintf(stderr, "could not stop tracing\n");
+				ret = -1;
 			}
 		}
-		
-
-		switch (dtrace_work(g_dtp, stdout, &con, NULL)) {
-		case DTRACE_WORKSTATUS_DONE:
-			done = 1;
-			break;
-		case DTRACE_WORKSTATUS_OKAY:
-			break;
-		case DTRACE_WORKSTATUS_ERROR:
-		default:
-			if (dtrace_errno(g_dtp) != EINTR) 
-				fprintf(stderr, "%s",
-				    dtrace_errmsg(g_dtp, dtrace_errno(g_dtp)));
-				dfatal("processing aborted\n");
-			break;
-		}
-
 	} while (!done);
-
-destroy_nvlist:
-	nvlist_destroy(props);
-
-close_dlog:
-	close(dlog);
 
 destroy_dtrace:
 	/* Destroy dtrace the handle. */
 	fprintf(stdout, "%s: closing dtrace\n", g_pname);
 	dtrace_close(g_dtp);
 
-	return (0);
+destroy_nvlist:
+	/* Destory the nvlist used to store the Dlog producer arguments. */
+	nvlist_destroy(props);
+
+close_dlog:
+	/* Destroy dlog the handle. */
+	fprintf(stdout, "%s: closing dlog\n", g_pname);
+	close(dlog);
+
+	/* Close the DTrace script file handle. */	
+	(void) fclose(fp);
+
+free_script_args:	
+	/* Free the memory used to hold the script arguments. */	
+	free(script_argv);
+
+	return ret;
 }
 
