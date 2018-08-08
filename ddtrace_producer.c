@@ -63,55 +63,6 @@ intr(int signo)
 
 	g_intr = 1;
 }
-	
-/*ARGSUSED*/
-static int
-chew(const dtrace_probedata_t *data, void *arg)
-{
-	dtrace_probedesc_t *pd = data->dtpda_pdesc;
-	dtrace_eprobedesc_t *ed = data->dtpda_edesc;
-	processorid_t cpu = data->dtpda_cpu;
-
-	fprintf(stdout, "dtpd->id = %u\n", pd->dtpd_id);
-	fprintf(stdout, "dtepd->id = %u\n", ed->dtepd_epid);
-	fprintf(stdout, "dtpd->func = %s\n", pd->dtpd_func);
-	fprintf(stdout, "dtpd->name = %s\n", pd->dtpd_name);
-
-	return (DTRACE_CONSUME_THIS);
-}
-	
-/*ARGSUSED*/
-static int
-chewrec(const dtrace_probedata_t * data, const dtrace_recdesc_t * rec,
-    void * arg)
-{
-	dtrace_actkind_t act;
-	uintptr_t addr;
-
-	/* Check if the final record has been processed. */
-	if (rec == NULL) {
-
-		return (DTRACE_CONSUME_NEXT); 
-	}
-
-	fprintf(stdout, "chewrec %p\n", rec);
-	fprintf(stdout, "dtrd_action %u\n", rec->dtrd_action);
-	fprintf(stdout, "dtrd_size %u\n", rec->dtrd_size);
-	fprintf(stdout, "dtrd_alignment %u\n", rec->dtrd_alignment);
-	fprintf(stdout, "dtrd_format %u\n", rec->dtrd_format);
-	fprintf(stdout, "dtrd_arg  %lu\n", rec->dtrd_arg);
-	fprintf(stdout, "dtrd_uarg  %lu\n", rec->dtrd_uarg);
-
-	act = rec->dtrd_action;
-	addr = (uintptr_t)data->dtpda_data;
-
-	if (act == DTRACEACT_EXIT) {
-		g_status = *((uint32_t *) addr);
-		return (DTRACE_CONSUME_NEXT);
-	}
-
-	return (DTRACE_CONSUME_THIS); 
-}
 
 /*
  * Prototype distributed dtrace agent.
@@ -219,8 +170,8 @@ main(int argc, char *argv[])
 		goto destroy_nvlist;
 	}
 
-	con.dc_consume_probe = NULL; // ?chew;
-	con.dc_consume_rec = NULL; //chewrec;
+	con.dc_consume_probe = NULL;
+	con.dc_consume_rec = NULL;
 	con.dc_put_buf = NULL; 
 	con.dc_get_buf = NULL;
 
@@ -233,9 +184,9 @@ main(int argc, char *argv[])
 	}
 	fprintf(stdout, "%s: dtrace initialized\n", g_pname);
 
-	(void) dtrace_setopt(g_dtp, "aggsize", "4m");
-	(void) dtrace_setopt(g_dtp, "bufsize", "4k");
-	(void) dtrace_setopt(g_dtp, "bufpolicy", "switch");
+	//(void) dtrace_setopt(g_dtp, "aggsize", "4m");
+	(void) dtrace_setopt(g_dtp, "bufsize", "64m");
+	//(void) dtrace_setopt(g_dtp, "bufpolicy", "switch");
 	sprintf(konarg, "%d", dlog);
 	(void) dtrace_setopt(g_dtp, "konarg", konarg);
 	printf("%s: dtrace options set\n", g_pname);
@@ -270,7 +221,9 @@ main(int argc, char *argv[])
 
 	if (dtrace_go(g_dtp) != 0) {
 		
-		fprintf(stderr, "could not start dtrace instrumentation\n");
+		fprintf(stderr,
+		    "%s: could not start dtrace instrumentation: %s\n",
+		    g_pname, dtrace_errmsg(g_dtp, dtrace_errno(g_dtp)));
 		ret = -1;
 		goto destroy_dtrace;
 	}
