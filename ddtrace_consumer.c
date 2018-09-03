@@ -361,15 +361,6 @@ dtc_get_buf(dtrace_hdl_t *dtp, int cpu, dtrace_bufdesc_t **bufp)
 	if (buf == NULL)
 		return -1;
 
-	(void) dtrace_getopt(dtp, "bufsize", &size);
-	buf->dtbd_data = dt_zalloc(dtp, size);
-	if (buf->dtbd_data == NULL) {
-		dt_free(dtp, buf);
-		return -1;
-	}
-	buf->dtbd_size = size;
-	buf->dtbd_cpu = cpu;
-
 	/* Non-blocking poll of the log. */
 	rd_kafka_poll(rk, 0);
 
@@ -378,30 +369,22 @@ dtc_get_buf(dtrace_hdl_t *dtp, int cpu, dtrace_bufdesc_t **bufp)
 
 		if (!rkmessage->err && rkmessage->len > 0) {
 
+#ifdef DEBUG
 			fprintf(stdout, "%s: message in log %zu\n",
 			     g_pname, rkmessage->len);
+#endif
 
-			/*
 			buf->dtbd_data = dt_zalloc(dtp, rkmessage->len);
 			if (buf->dtbd_data == NULL) {
+
 				dt_free(dtp, buf);
 				return -1;
 			}
-			buf->dtbd_size = size;
+			buf->dtbd_size = rkmessage->len;
 			buf->dtbd_cpu = cpu;
 
 			memcpy(buf->dtbd_data, rkmessage->payload,
 			    rkmessage->len);
-
-			*bufp = buf;
-			return 0;
-			*/
-
-			// TODO: ensure that the message fits within the
-			// buffer
-			if (rkmessage->len <= buf->dtbd_size)
-				memcpy(buf->dtbd_data,
-				    rkmessage->payload, rkmessage->len);
 		} else {
 			if (rkmessage->err ==
 			    RD_KAFKA_RESP_ERR__PARTITION_EOF) {
