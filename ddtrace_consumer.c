@@ -40,6 +40,8 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "dl_assert.h"
+
 static int dtc_get_buf(dtrace_hdl_t *, int, dtrace_bufdesc_t **);
 static void dtc_put_buf(dtrace_hdl_t *, dtrace_bufdesc_t *b);
 
@@ -69,11 +71,11 @@ dtc_intr(int signo)
 static int
 chew(const dtrace_probedata_t *data, void *arg)
 {
+#ifndef NDEBUG
 	dtrace_probedesc_t *pd = data->dtpda_pdesc;
 	dtrace_eprobedesc_t *ed = data->dtpda_edesc;
 	processorid_t cpu = data->dtpda_cpu;
 
-#ifndef NDEBUG
 	fprintf(stdout, "dtpd->id = %u\n", pd->dtpd_id);
 	fprintf(stdout, "dtepd->id = %u\n", ed->dtepd_epid);
 	fprintf(stdout, "dtpd->func = %s\n", pd->dtpd_func);
@@ -306,11 +308,12 @@ main(int argc, char *argv[])
 
 	int done = 0;
 	do {
+		if (!done || !g_intr)
+			dtrace_sleep(dtp);	
+
 		if (done || g_intr) {
 			done = 1;
 		}
-	
-		dtrace_sleep(dtp);	
 
 		switch (dtrace_work_detached(dtp, stdout, &con, rkt)) {
 		case DTRACE_WORKSTATUS_DONE:
@@ -360,6 +363,9 @@ dtc_get_buf(dtrace_hdl_t *dtp, int cpu, dtrace_bufdesc_t **bufp)
 	dtrace_bufdesc_t *buf;
 	rd_kafka_message_t *rkmessage;
 	int partition = 0;
+	
+	DL_ASSERT(dtp != NULL, ("DTrace handle cannot be NULL"));
+	DL_ASSERT(buf != NULL, ("Buffer instance to free cannot be NULL"));
 
 	buf = dt_zalloc(dtp, sizeof(*buf));
 	if (buf == NULL)
@@ -409,6 +415,11 @@ dtc_get_buf(dtrace_hdl_t *dtp, int cpu, dtrace_bufdesc_t **bufp)
 static void
 dtc_put_buf(dtrace_hdl_t *dtp, dtrace_bufdesc_t *buf)
 {
+
+	DL_ASSERT(dtp != NULL, ("DTrace handle cannot be NULL"));
+	DL_ASSERT(buf != NULL, ("Buffer instance to free cannot be NULL"));
+	DL_ASSERT(buf->dtbd_data != NULL,
+	    ("Buffer data pointer cannot be NULL"));
 
 	dt_free(dtp, buf->dtbd_data);
 	dt_free(dtp, buf);
