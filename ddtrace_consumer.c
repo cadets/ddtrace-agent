@@ -301,7 +301,9 @@ main(int argc, char *argv[])
 		if (done || g_intr) {
 			done = 1;
 		}
-		
+	
+		dtrace_sleep(dtp);	
+
 		switch (dtrace_work_detached(dtp, stdout, &con, rkt)) {
 		case DTRACE_WORKSTATUS_DONE:
 			done = 1;
@@ -369,7 +371,7 @@ dtc_get_buf(dtrace_hdl_t *dtp, int cpu, dtrace_bufdesc_t **bufp)
 	buf->dtbd_cpu = cpu;
 
 	/* Non-blocking poll of the log. */
-	rd_kafka_poll(rk, 1000);
+	rd_kafka_poll(rk, 0);
 
 	rkmessage = rd_kafka_consume(rkt, partition, 0);
 	if (rkmessage != NULL) {
