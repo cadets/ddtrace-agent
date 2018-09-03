@@ -34,10 +34,10 @@
 #include <errno.h>
 #include <libgen.h>
 #include <librdkafka/rdkafka.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
-#include <signal.h>
 #include <unistd.h>
 
 static int dtc_get_buf(dtrace_hdl_t *, int, dtrace_bufdesc_t **);
@@ -73,7 +73,7 @@ chew(const dtrace_probedata_t *data, void *arg)
 	dtrace_eprobedesc_t *ed = data->dtpda_edesc;
 	processorid_t cpu = data->dtpda_cpu;
 
-#ifdef DEBUG
+#ifndef NDEBUG
 	fprintf(stdout, "dtpd->id = %u\n", pd->dtpd_id);
 	fprintf(stdout, "dtepd->id = %u\n", ed->dtepd_epid);
 	fprintf(stdout, "dtpd->func = %s\n", pd->dtpd_func);
@@ -97,7 +97,7 @@ chewrec(const dtrace_probedata_t * data, const dtrace_recdesc_t * rec,
 		return (DTRACE_CONSUME_NEXT); 
 	}
 
-#ifdef DEBUG
+#ifndef NDEBUG
 	fprintf(stdout, "chewrec %p\n", rec);
 	fprintf(stdout, "dtrd_action %u\n", rec->dtrd_action);
 	fprintf(stdout, "dtrd_size %u\n", rec->dtrd_size);
@@ -260,13 +260,17 @@ main(int argc, char *argv[])
 		ret = -1;
 		goto destroy_kafka;
 	}
+#ifndef NDEBUG
 	fprintf(stdout, "%s: dtrace initialized\n", g_pname);
+#endif
 
 	(void) dtrace_setopt(dtp, "aggsize", "4m");
 	(void) dtrace_setopt(dtp, "bufsize", "4k");
 	(void) dtrace_setopt(dtp, "bufpolicy", "switch");
 	(void) dtrace_setopt(dtp, "destructive", 0);
+#ifndef NDEBUG
 	printf("%s: dtrace options set\n", g_pname);
+#endif
 
 	if ((prog = dtrace_program_fcompile(dtp, fp,
 	    DTRACE_C_PSPEC | DTRACE_C_CPP, script_argc, script_argv)) == NULL) {
@@ -276,7 +280,9 @@ main(int argc, char *argv[])
 		ret = -1;
 		goto destroy_dtrace;
 	}
+#ifndef NDEBUG
 	fprintf(stdout, "%s: dtrace program compiled\n", g_pname);
+#endif
 	
 	(void) fclose(fp);
 	
@@ -287,7 +293,9 @@ main(int argc, char *argv[])
 		ret = -1;
 		goto destroy_dtrace;
 	}
+#ifndef NDEBUG
 	fprintf(stdout, "%s: dtrace probes enabled\n", g_pname);
+#endif
 
 	struct sigaction act;
 	(void) sigemptyset(&act.sa_mask);
@@ -301,7 +309,9 @@ main(int argc, char *argv[])
 		if (done || g_intr) {
 			done = 1;
 		}
-		
+	
+		dtrace_sleep(dtp);	
+
 		switch (dtrace_work_detached(dtp, stdout, &con, rkt)) {
 		case DTRACE_WORKSTATUS_DONE:
 			done = 1;
@@ -319,17 +329,11 @@ main(int argc, char *argv[])
 
 	} while (!done);
 
-	/* Poll to handle delivery reports. */
-	rd_kafka_poll(rk, 0);
-
-	/* Wait for messages to be delivered. */
-	while (rd_kafka_outq_len(rk) > 0) {
-		rd_kafka_poll(rk, 100);
-	}
-
 destroy_dtrace:
 	/* Destroy dtrace the handle. */
+#ifndef NDEBUG
 	fprintf(stdout, "%s: closing dtrace\n", g_pname);
+#endif
 	dtrace_close(dtp);
 
 destroy_kafka:
@@ -337,7 +341,9 @@ destroy_kafka:
 	rd_kafka_topic_destroy(rkt);
 
 	/* Destroy the Kafka handle. */
+#ifndef NDEBUG
 	fprintf(stdout, "%s: destroy kafka handle\n", g_pname);
+#endif
 	rd_kafka_destroy(rk);
 
 free_script_args:	
@@ -359,53 +365,38 @@ dtc_get_buf(dtrace_hdl_t *dtp, int cpu, dtrace_bufdesc_t **bufp)
 	if (buf == NULL)
 		return -1;
 
-	(void) dtrace_getopt(dtp, "bufsize", &size);
-	buf->dtbd_data = dt_zalloc(dtp, size);
-	if (buf->dtbd_data == NULL) {
-		dt_free(dtp, buf);
-		return -1;
-	}
-	buf->dtbd_size = size;
-	buf->dtbd_cpu = cpu;
-
 	/* Non-blocking poll of the log. */
-	rd_kafka_poll(rk, 1000);
+	rd_kafka_poll(rk, 0);
 
 	rkmessage = rd_kafka_consume(rkt, partition, 0);
 	if (rkmessage != NULL) {
 
 		if (!rkmessage->err && rkmessage->len > 0) {
 
+#ifndef NDEBUG
 			fprintf(stdout, "%s: message in log %zu\n",
 			     g_pname, rkmessage->len);
+#endif
 
-			/*
 			buf->dtbd_data = dt_zalloc(dtp, rkmessage->len);
 			if (buf->dtbd_data == NULL) {
+
 				dt_free(dtp, buf);
 				return -1;
 			}
-			buf->dtbd_size = size;
+			buf->dtbd_size = rkmessage->len;
 			buf->dtbd_cpu = cpu;
 
 			memcpy(buf->dtbd_data, rkmessage->payload,
 			    rkmessage->len);
-
-			*bufp = buf;
-			return 0;
-			*/
-
-			// TODO: ensure that the message fits within the
-			// buffer
-			if (rkmessage->len <= buf->dtbd_size)
-				memcpy(buf->dtbd_data,
-				    rkmessage->payload, rkmessage->len);
 		} else {
+#ifndef NDEBUG
 			if (rkmessage->err ==
 			    RD_KAFKA_RESP_ERR__PARTITION_EOF) {
 				fprintf(stdout, "%s: no message in log\n",
 				     g_pname);
 			}
+#endif
 		}
 
 		rd_kafka_message_destroy(rkmessage);

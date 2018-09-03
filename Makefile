@@ -56,6 +56,7 @@ LDADD+=-lrdkafka
 LDADD+=-lsbuf #?
 LDADD+=-lnv
 
+CFLAGS+=-DNDEBUG
 CFLAGS+=-DNEED_SOLARIS_BOOLEAN
 CFLAGS+=-L/usr/local/lib
 CFLAGS+=-I/usr/local/include
