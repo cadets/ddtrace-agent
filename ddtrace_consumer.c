@@ -41,22 +41,29 @@
 #include <unistd.h>
 
 #include "dl_assert.h"
+#include "dl_utils.h"
 
 static int dtc_get_buf(dtrace_hdl_t *, int, dtrace_bufdesc_t **);
 static void dtc_put_buf(dtrace_hdl_t *, dtrace_bufdesc_t *b);
+static int dtc_buffered_handler(const dtrace_bufdata_t *, void *);
+static int dtc_setup_rx_topic(char *, char *);
+static int dtc_setup_tx_topic(char *, char *);
 
 static char *g_pname;
 static int g_status = 0;
 static int g_intr;
-static rd_kafka_t *rk;
-static rd_kafka_topic_t *rkt;
+static rd_kafka_t *rx_rk;
+static rd_kafka_t *tx_rk;
+static rd_kafka_topic_t *tx_topic;
+static rd_kafka_topic_t *rx_topic;
 
 static inline void 
 dtc_usage(FILE * fp)
 {
 
 	(void) fprintf(fp,
-	    "Usage: %s -b brokers -t input_topic -s script\n", g_pname);
+	    "Usage: %s -b brokers -d -i input_topic"
+	    "[-o output_topic] -s script\n", g_pname);
 }
 
 /*ARGSUSED*/
@@ -76,10 +83,10 @@ chew(const dtrace_probedata_t *data, void *arg)
 	dtrace_eprobedesc_t *ed = data->dtpda_edesc;
 	processorid_t cpu = data->dtpda_cpu;
 
-	fprintf(stdout, "dtpd->id = %u\n", pd->dtpd_id);
-	fprintf(stdout, "dtepd->id = %u\n", ed->dtepd_epid);
-	fprintf(stdout, "dtpd->func = %s\n", pd->dtpd_func);
-	fprintf(stdout, "dtpd->name = %s\n", pd->dtpd_name);
+	DLOGTR1(PRIO_LOW, "dtpd->id = %u\n", pd->dtpd_id);
+	DLOGTR1(PRIO_LOW, "dtepd->id = %u\n", ed->dtepd_epid);
+	DLOGTR1(PRIO_LOW, "dtpd->func = %s\n", pd->dtpd_func);
+	DLOGTR1(PRIO_LOW, "dtpd->name = %s\n", pd->dtpd_name);
 #endif
 
 	return (DTRACE_CONSUME_THIS);
@@ -100,13 +107,13 @@ chewrec(const dtrace_probedata_t * data, const dtrace_recdesc_t * rec,
 	}
 
 #ifndef NDEBUG
-	fprintf(stdout, "chewrec %p\n", rec);
-	fprintf(stdout, "dtrd_action %u\n", rec->dtrd_action);
-	fprintf(stdout, "dtrd_size %u\n", rec->dtrd_size);
-	fprintf(stdout, "dtrd_alignment %u\n", rec->dtrd_alignment);
-	fprintf(stdout, "dtrd_format %u\n", rec->dtrd_format);
-	fprintf(stdout, "dtrd_arg  %lu\n", rec->dtrd_arg);
-	fprintf(stdout, "dtrd_uarg  %lu\n", rec->dtrd_uarg);
+	DLOGTR1(PRIO_LOW, "chewrec %p\n", rec);
+	DLOGTR1(PRIO_LOW, "dtrd_action %u\n", rec->dtrd_action);
+	DLOGTR1(PRIO_LOW, "dtrd_size %u\n", rec->dtrd_size);
+	DLOGTR1(PRIO_LOW, "dtrd_alignment %u\n", rec->dtrd_alignment);
+	DLOGTR1(PRIO_LOW, "dtrd_format %u\n", rec->dtrd_format);
+	DLOGTR1(PRIO_LOW, "dtrd_arg  %lu\n", rec->dtrd_arg);
+	DLOGTR1(PRIO_LOWPRIO_LOi, "dtrd_uarg  %lu\n", rec->dtrd_uarg);
 #endif
 
 	act = rec->dtrd_action;
@@ -118,242 +125,6 @@ chewrec(const dtrace_probedata_t * data, const dtrace_recdesc_t * rec,
 	}
 
 	return (DTRACE_CONSUME_THIS); 
-}
-
-/*
- * Prototype distributed dtrace agent.
- * The agent recieves DTrace records from an Apache Kafka topic and prints
- * them using libdtrace.
- */
-int
-main(int argc, char *argv[])
-{
-	dtrace_consumer_t con;
-	dtrace_prog_t * prog;
-	dtrace_proginfo_t info;
-	dtrace_hdl_t *dtp;
-	FILE *fp;
-	rd_kafka_conf_t *conf;
-	rd_kafka_topic_conf_t *topic_conf;
-	int64_t start_offset = RD_KAFKA_OFFSET_BEGINNING;
-	int c, err, partition = 0, ret = 0, script_argc = 0;
-	char *args, *brokers, *topic_name;
-	char **script_argv;
-	char errstr[512];
-
-	g_pname = basename(argv[0]); 	
-
-	/** Allocate space required for any arguments being passed to the
-	 *  D-language script.
-	 */
-	script_argv = (char **) malloc(sizeof(char *) * argc);
-	if (script_argv == NULL) {
-
-		fprintf(stderr, "%s: failed to allocate script arguments\n",
-		    g_pname);
-		exit(EXIT_FAILURE);
-	}
-
-	opterr = 0;
-	for (optind = 0; optind < argc; optind++) {
-		while ((c = getopt(argc, argv, "b:t:s:")) != -1) {
-			switch(c) {
-			case 'b':
-				brokers = optarg;
-				break;
-			case 't':
-				topic_name = optarg;
-				break;
-			case 's':
-				if ((fp = fopen(optarg, "r")) == NULL) {
-
-					fprintf(stderr,
-					    "%s: failed to open script file "
-					    "%s\n", optarg, g_pname);
-					ret = -1;
-					goto free_script_args;
-				}
-				break;
-			case '?':
-			default:
-				dtc_usage(stderr);
-				ret = -1;
-				goto free_script_args;
-			}
-		}
-
-		if (optind < argc)
-			script_argv[script_argc++] = argv[optind];
-	}
-
-	if (brokers == NULL || topic_name == NULL || fp == NULL) {
-
-		dtc_usage(stderr);
-		ret = -1;
-		goto free_script_args;
-	}
-
-	/* Setup the Kafka topic used for receiving DTrace records. */
-	conf = rd_kafka_conf_new();
-	if (conf == NULL) {
-
-		fprintf(stderr, "%s: failed to create Kafka conf: %s\n",
-		    g_pname, rd_kafka_err2str(rd_kafka_last_error()));
-		ret = -1;
-		goto free_script_args;
-	}
-
-	if (!(rk = rd_kafka_new(RD_KAFKA_CONSUMER, conf, errstr,
-	    sizeof(errstr)))) {
-
-		fprintf(stderr, "%s: failed to create Kafka consumer: %s\n",
-		    g_pname, errstr);
-		goto free_script_args;
-	}
-
-	if (rd_kafka_brokers_add(rk, brokers) < 1) {
-
-		fprintf(stderr, "%s: no valid brokers specified: %s\n",
-		    g_pname, rd_kafka_err2str(rd_kafka_last_error()));
-		ret = -1;
-		goto destroy_kafka;
-	}
-
-	topic_conf = rd_kafka_topic_conf_new();
-	if (topic_conf == NULL) {
-
-		fprintf(stderr, "%s: failed to start consuming: %s\n",
-		    g_pname, rd_kafka_err2str(rd_kafka_last_error()));
-		ret = -1;
-		goto destroy_kafka;
-	}
-
-	if (!(rkt = rd_kafka_topic_new(rk, topic_name, topic_conf))) {
-
-		fprintf(stderr, "%s: failed to create Kafka topic %s: %s\n",
-		    g_pname, topic_name,
-		    rd_kafka_err2str(rd_kafka_last_error()));
-		ret = -1;
-		goto destroy_kafka;
-	}
-
-	if (rd_kafka_consume_start(rkt, partition, start_offset) == -1) {
-
-		fprintf(stderr, "%s: failed to start consuming: %s\n",
-		    g_pname, rd_kafka_err2str(rd_kafka_last_error()));
-		if (errno == EINVAL) {
-	        	fprintf(stderr, "%s: broker based offset storage "
-			    "requires a group.id, "
-			    "add: -X group.id=yourGroup\n", g_pname);
-		}
-		ret = -1;
-		goto destroy_kafka;
-	}
-	
-	con.dc_consume_probe = chew;
-	con.dc_consume_rec = chewrec;
-	con.dc_put_buf = dtc_put_buf;
-	con.dc_get_buf = dtc_get_buf;
-
-	if ((dtp = dtrace_open(DTRACE_VERSION, 0, &err)) == NULL) {
-
-		fprintf(stderr, "%s: failed to initialize dtrace %s",
-		    g_pname, dtrace_errmsg(dtp, dtrace_errno(dtp)));
-		ret = -1;
-		goto destroy_kafka;
-	}
-#ifndef NDEBUG
-	fprintf(stdout, "%s: dtrace initialized\n", g_pname);
-#endif
-
-	(void) dtrace_setopt(dtp, "aggsize", "4m");
-	(void) dtrace_setopt(dtp, "bufsize", "4k");
-	(void) dtrace_setopt(dtp, "bufpolicy", "switch");
-	(void) dtrace_setopt(dtp, "destructive", 0);
-#ifndef NDEBUG
-	printf("%s: dtrace options set\n", g_pname);
-#endif
-
-	if ((prog = dtrace_program_fcompile(dtp, fp,
-	    DTRACE_C_PSPEC | DTRACE_C_CPP, script_argc, script_argv)) == NULL) {
-
-		fprintf(stderr, "%s: failed to compile dtrace program %s",
-		    g_pname, dtrace_errmsg(dtp, dtrace_errno(dtp)));
-		ret = -1;
-		goto destroy_dtrace;
-	}
-#ifndef NDEBUG
-	fprintf(stdout, "%s: dtrace program compiled\n", g_pname);
-#endif
-	
-	(void) fclose(fp);
-	
-	if (dtrace_program_exec(dtp, prog, &info) == -1) {
-
-		fprintf(stderr, "%s: failed to enable dtrace probes %s",
-		    g_pname, dtrace_errmsg(dtp, dtrace_errno(dtp)));
-		ret = -1;
-		goto destroy_dtrace;
-	}
-#ifndef NDEBUG
-	fprintf(stdout, "%s: dtrace probes enabled\n", g_pname);
-#endif
-
-	struct sigaction act;
-	(void) sigemptyset(&act.sa_mask);
-	act.sa_flags = 0;
-	act.sa_handler = dtc_intr;
-	(void) sigaction(SIGINT, &act, NULL);
-	(void) sigaction(SIGTERM, &act, NULL);
-
-	int done = 0;
-	do {
-		if (!done || !g_intr)
-			dtrace_sleep(dtp);	
-
-		if (done || g_intr) {
-			done = 1;
-		}
-
-		switch (dtrace_work_detached(dtp, stdout, &con, rkt)) {
-		case DTRACE_WORKSTATUS_DONE:
-			done = 1;
-			break;
-		case DTRACE_WORKSTATUS_OKAY:
-			break;
-		case DTRACE_WORKSTATUS_ERROR:
-		default:
-			if (dtrace_errno(dtp) != EINTR) 
-				fprintf(stderr, "%s : %s", g_pname,
-				    dtrace_errmsg(dtp, dtrace_errno(dtp)));
-				done = 1;
-			break;
-		}
-
-	} while (!done);
-
-destroy_dtrace:
-	/* Destroy dtrace the handle. */
-#ifndef NDEBUG
-	fprintf(stdout, "%s: closing dtrace\n", g_pname);
-#endif
-	dtrace_close(dtp);
-
-destroy_kafka:
-	/* Destroy the Kafka topic */
-	rd_kafka_topic_destroy(rkt);
-
-	/* Destroy the Kafka handle. */
-#ifndef NDEBUG
-	fprintf(stdout, "%s: destroy kafka handle\n", g_pname);
-#endif
-	rd_kafka_destroy(rk);
-
-free_script_args:	
-	/* Free the memory used to hold the script arguments. */	
-	free(script_argv);
-
-	return ret;
 }
 
 static int
@@ -372,17 +143,15 @@ dtc_get_buf(dtrace_hdl_t *dtp, int cpu, dtrace_bufdesc_t **bufp)
 		return -1;
 
 	/* Non-blocking poll of the log. */
-	rd_kafka_poll(rk, 0);
+	rd_kafka_poll(rx_rk, 0);
 
-	rkmessage = rd_kafka_consume(rkt, partition, 0);
+	rkmessage = rd_kafka_consume(rx_topic, partition, 0);
 	if (rkmessage != NULL) {
 
 		if (!rkmessage->err && rkmessage->len > 0) {
 
-#ifndef NDEBUG
-			fprintf(stdout, "%s: message in log %zu\n",
+			DLOGTR2(PRIO_LOW, "%s: message in log %zu\n",
 			     g_pname, rkmessage->len);
-#endif
 
 			buf->dtbd_data = dt_zalloc(dtp, rkmessage->len);
 			if (buf->dtbd_data == NULL) {
@@ -396,13 +165,11 @@ dtc_get_buf(dtrace_hdl_t *dtp, int cpu, dtrace_bufdesc_t **bufp)
 			memcpy(buf->dtbd_data, rkmessage->payload,
 			    rkmessage->len);
 		} else {
-#ifndef NDEBUG
 			if (rkmessage->err ==
 			    RD_KAFKA_RESP_ERR__PARTITION_EOF) {
-				fprintf(stdout, "%s: no message in log\n",
-				     g_pname);
+				DLOGTR1(PRIO_HIGH,
+				    "%s: no message in log\n", g_pname);
 			}
-#endif
 		}
 
 		rd_kafka_message_destroy(rkmessage);
@@ -423,4 +190,431 @@ dtc_put_buf(dtrace_hdl_t *dtp, dtrace_bufdesc_t *buf)
 
 	dt_free(dtp, buf->dtbd_data);
 	dt_free(dtp, buf);
+}
+
+static int
+dtc_buffered_handler(const dtrace_bufdata_t *buf_data, void *arg)
+{
+	rd_kafka_topic_t *tx_topic = (rd_kafka_topic_t *) arg;
+	size_t len;
+
+	DL_ASSERT(tx_topic != NULL, ("Transmit topic cannot be NULL"));
+
+retry:
+        if (rd_kafka_produce(
+		/* Topic object */
+		tx_topic,
+		/* Use builtin partitioner to select partition*/
+		RD_KAFKA_PARTITION_UA,
+		/* Make a copy of the payload. */
+		RD_KAFKA_MSG_F_COPY,
+		/* Message payload (value) and length */
+		(void *) buf_data->dtbda_buffered,
+		strlen(buf_data->dtbda_buffered),
+		/* Optional key and its length */
+		NULL, 0,
+		/* Message opaque, provided in
+		 * delivery report callback as
+		 * msg_opaque. */
+		NULL) == -1) {
+		/**
+		* Failed to *enqueue* message for producing.
+		*/
+		DLOGTR2(PRIO_HIGH,
+		    "%% Failed to produce to topic %s: %s\n",
+		    rd_kafka_topic_name(rx_topic),
+		    rd_kafka_err2str(rd_kafka_last_error()));
+
+		/* Poll to handle delivery reports */
+		if (rd_kafka_last_error() ==
+		    RD_KAFKA_RESP_ERR__QUEUE_FULL) {
+			/* If the internal queue is full, wait for
+			 * messages to be delivered and then retry.
+			 * The internal queue represents both
+			 * messages to be sent and messages that have
+			 * been sent or failed, awaiting their
+			 * delivery report callback to be called.
+			 *
+			 * The internal queue is limited by the
+			 * configuration property
+			 * queue.buffering.max.messages */
+			rd_kafka_poll(tx_rk, 1000 /*block for max 1000ms*/);
+			goto retry;
+		}
+	} else {
+		DLOGTR2(PRIO_LOW,
+		    "%% Enqueued message (%zd bytes) for topic %s\n",
+		    len, rd_kafka_topic_name(tx_topic));
+	}
+	return 0;
+}
+
+static int
+dtc_setup_rx_topic(char *topic_name, char *brokers)
+{
+	rd_kafka_conf_t *conf;
+	char errstr[512];
+
+	DL_ASSERT(topic_name != NULL,
+	    ("Receive topic name cannot be NULL"));
+	DL_ASSERT(brokers != NULL,
+	    ("Receive topic brokers cannot be NULL"));
+
+	/* Setup the Kafka topic used for receiving DTrace records. */
+	conf = rd_kafka_conf_new();
+	if (conf == NULL) {
+
+		DLOGTR2(PRIO_HIGH, "%s: failed to create Kafka conf: %s\n",
+		    g_pname, rd_kafka_err2str(rd_kafka_last_error()));
+		goto configure_rx_topic_err;
+	}
+
+	/* Set bootstrap broker(s) as a comma-separated list of
+         * host or host:port (default port 9092).
+         * librdkafka will use the bootstrap brokers to acquire the full
+         * set of brokers from the cluster.
+	 */
+        if (rd_kafka_conf_set(conf, "bootstrap.servers", brokers,
+	    errstr, sizeof(errstr)) != RD_KAFKA_CONF_OK) {
+
+                DLOGTR1(PRIO_HIGH, "%s\n", errstr);
+		goto configure_rx_topic_new_err;
+        }
+
+	/* Create the Kafka consumer.
+	 * The configuration instance does not need to be freed after
+	 * this succeeds.
+	 */
+	if (!(rx_rk = rd_kafka_new(RD_KAFKA_CONSUMER, conf, errstr,
+	    sizeof(errstr)))) {
+
+		DLOGTR2(PRIO_HIGH, "%s: failed to create Kafka consumer: %s\n",
+		    g_pname, errstr);
+		goto configure_rx_topic_new_err;
+	}
+
+	if (!(rx_topic = rd_kafka_topic_new(rx_rk, topic_name, NULL))) {
+
+		DLOGTR3(PRIO_HIGH,
+		    "%s: failed to create Kafka topic %s: %s\n",
+		    g_pname, topic_name,
+		    rd_kafka_err2str(rd_kafka_last_error()));
+		goto configure_rx_topic_new_err;
+	}
+
+	return 0;
+
+configure_rx_topic_new_err:
+	rd_kafka_destroy(rx_rk);
+
+configure_rx_topic_conf_err:
+	rd_kafka_conf_destroy(conf);
+
+configure_rx_topic_err:
+	return -1;
+
+}
+
+static int
+dtc_setup_tx_topic(char *topic_name, char *brokers)
+{
+	rd_kafka_conf_t *conf;
+	char errstr[512];
+
+	DL_ASSERT(topic_name != NULL,
+	    ("Transmit topic name cannot be NULL"));
+	DL_ASSERT(brokers != NULL,
+	    ("Receive topic brokers cannot be NULL"));
+
+	/* Setup the Kafka topic used for receiving DTrace records. */
+	conf = rd_kafka_conf_new();
+	if (conf == NULL) {
+
+		DLOGTR2(PRIO_HIGH, "%s: failed to create Kafka conf: %s\n",
+		    g_pname, rd_kafka_err2str(rd_kafka_last_error()));
+		goto configure_tx_topic_err;
+	}
+
+       	/* Set bootstrap broker(s) as a comma-separated list of
+         * host or host:port (default port 9092).
+         * librdkafka will use the bootstrap brokers to acquire the full
+         * set of brokers from the cluster.
+	 */
+        if (rd_kafka_conf_set(conf, "bootstrap.servers", brokers,
+	    errstr, sizeof(errstr)) != RD_KAFKA_CONF_OK) {
+
+                DLOGTR1(PRIO_HIGH, "%s\n", errstr);
+		goto configure_tx_topic_conf_err;
+        }
+
+	/* Create the Kafka producer.
+	 * The configuration instance does not need to be freed after
+	 * this succeeds.
+	 */
+	if (!(tx_rk = rd_kafka_new(RD_KAFKA_CONSUMER, conf, errstr,
+	    sizeof(errstr)))) {
+
+		DLOGTR2(PRIO_HIGH,
+		    "%s: failed to create Kafka consumer: %s\n",
+		    g_pname, errstr);
+		goto configure_tx_topic_conf_err;
+	}
+
+	if (!(tx_topic = rd_kafka_topic_new(tx_rk, topic_name, NULL))) {
+
+		DLOGTR3(PRIO_HIGH,
+		    "%s: failed to create Kafka topic %s: %s\n",
+		    g_pname, topic_name,
+		    rd_kafka_err2str(rd_kafka_last_error()));
+		goto configure_tx_topic_new_err;
+	}
+
+	return 0;
+
+configure_tx_topic_new_err:
+	rd_kafka_destroy(tx_rk);
+
+configure_tx_topic_conf_err:
+	rd_kafka_conf_destroy(conf);
+
+configure_tx_topic_err:
+	return -1;
+}
+
+/*
+ * Prototype distributed dtrace agent.
+ * The agent recieves DTrace records from an Apache Kafka topic and prints
+ * them using libdtrace.
+ */
+int
+main(int argc, char *argv[])
+{
+	dtrace_consumer_t con;
+	dtrace_prog_t *prog;
+	dtrace_proginfo_t info;
+	dtrace_hdl_t *dtp;
+	FILE *fp = NULL;
+	int64_t start_offset = RD_KAFKA_OFFSET_BEGINNING;
+	int c, err, partition = 0, ret = 0, script_argc = 0;
+	char *args, *brokers = NULL, *rx_topic_name = NULL,
+	    *tx_topic_name = NULL;
+	char **script_argv;
+	int debug = 0;
+
+	g_pname = basename(argv[0]); 	
+
+	/** Allocate space required for any arguments being passed to the
+	 *  D-language script.
+	 */
+	script_argv = (char **) malloc(sizeof(char *) * argc);
+	if (script_argv == NULL) {
+
+		DLOGTR1(PRIO_HIGH,
+		    "%s: failed to allocate script arguments\n", g_pname);
+		exit(EXIT_FAILURE);
+	}
+
+	opterr = 0;
+	for (optind = 0; optind < argc; optind++) {
+		while ((c = getopt(argc, argv, "b:idi:o:s:")) != -1) {
+			switch(c) {
+			case 'b':
+				brokers = optarg;
+				break;
+			case 'd':
+				debug = 1;
+				break;
+			case 'i':
+				rx_topic_name = optarg;
+				break;
+			case 'o':
+				tx_topic_name = optarg;
+				break;
+			case 's':
+				if ((fp = fopen(optarg, "r")) == NULL) {
+
+					DLOGTR2(PRIO_HIGH,
+					    "%s: failed to open script file "
+					    "%s\n", optarg, g_pname);
+					ret = -1;
+					goto free_script_args;
+				}
+				break;
+			case '?':
+			default:
+				dtc_usage(stderr);
+				ret = -1;
+				goto free_script_args;
+			}
+		}
+
+		if (optind < argc)
+			script_argv[script_argc++] = argv[optind];
+	}
+
+	if (brokers == NULL || rx_topic_name == NULL || fp == NULL) {
+
+		dtc_usage(stderr);
+		ret = -1;
+		goto free_script_args;
+	}
+
+	/* Daemonise */
+
+	if (dtc_setup_rx_topic(rx_topic_name, brokers) != 0){
+
+		ret = -1;
+		goto free_script_args;
+	}
+
+
+	if (rd_kafka_consume_start(rx_topic, partition, start_offset) == -1) {
+
+		DLOGTR2(PRIO_HIGH, "%s: failed to start consuming: %s\n",
+		    g_pname, rd_kafka_err2str(rd_kafka_last_error()));
+		if (errno == EINVAL) {
+	        	DLOGTR1(PRIO_HIGH,
+			    "%s: broker based offset storage "
+			    "requires a group.id, "
+			    "add: -X group.id=yourGroup\n", g_pname);
+		}
+		ret = -1;
+		goto destroy_rx_kafka;
+	}
+	
+	con.dc_consume_probe = chew;
+	con.dc_consume_rec = chewrec;
+	con.dc_put_buf = dtc_put_buf;
+	con.dc_get_buf = dtc_get_buf;
+
+	if ((dtp = dtrace_open(DTRACE_VERSION, 0, &err)) == NULL) {
+
+		DLOGTR2(PRIO_HIGH, "%s: failed to initialize dtrace %s",
+		    g_pname, dtrace_errmsg(dtp, dtrace_errno(dtp)));
+		ret = -1;
+		goto destroy_rx_kafka;
+	}
+	DLOGTR1(PRIO_LOW, "%s: dtrace initialized\n", g_pname);
+
+	/* If the transmit topic name is configured create a new tranmitting
+	 * topic and register a buffered handler to write to this
+	 * topic with dtrace.
+	 */
+       if (tx_topic_name != NULL) {	
+		if (dtc_setup_tx_topic(tx_topic_name, brokers)
+		    != 0) {
+	
+			ret = -1;
+			goto destroy_dtrace;
+		}
+
+		if (dtrace_handle_buffered(dtp, dtc_buffered_handler,
+		    tx_topic)) {
+
+			DLOGTR2(PRIO_HIGH,
+			    "%s: failed registering dtrace "
+			    "buffered handler %s",
+			    g_pname, dtrace_errmsg(dtp, dtrace_errno(dtp)));
+			ret = -1;
+			goto destroy_tx_kafka;
+		}
+	}
+
+	/* Configure dtrace.
+	 * Trivially small buffers can be configured as trace collection
+	 * does not occure locally.
+	 * Desctructive tracing prevents dtrace from being terminated
+	 * (though this shouldn't happen as tracing is nver enabled).
+	 */
+	(void) dtrace_setopt(dtp, "aggsize", "4k");
+	(void) dtrace_setopt(dtp, "bufsize", "4k");
+	(void) dtrace_setopt(dtp, "bufpolicy", "switch");
+	(void) dtrace_setopt(dtp, "destructive", "1");
+	DLOGTR1(PRIO_LOW, "%s: dtrace options set\n", g_pname);
+
+	if ((prog = dtrace_program_fcompile(dtp, fp,
+	    DTRACE_C_PSPEC | DTRACE_C_CPP, script_argc, script_argv)) == NULL) {
+
+		DLOGTR2(PRIO_HIGH, "%s: failed to compile dtrace program %s",
+		    g_pname, dtrace_errmsg(dtp, dtrace_errno(dtp)));
+		ret = -1;
+		goto destroy_tx_kafka;
+	}
+	DLOGTR1(PRIO_LOW, "%s: dtrace program compiled\n", g_pname);
+	
+	(void) fclose(fp);
+	
+	if (dtrace_program_exec(dtp, prog, &info) == -1) {
+
+		DLOGTR2(PRIO_HIGH, "%s: failed to enable dtrace probes %s",
+		    g_pname, dtrace_errmsg(dtp, dtrace_errno(dtp)));
+		ret = -1;
+		goto destroy_tx_kafka;
+	}
+	DLOGTR1(PRIO_LOW, "%s: dtrace probes enabled\n", g_pname);
+
+	struct sigaction act;
+	(void) sigemptyset(&act.sa_mask);
+	act.sa_flags = 0;
+	act.sa_handler = dtc_intr;
+	(void) sigaction(SIGINT, &act, NULL);
+	(void) sigaction(SIGTERM, &act, NULL);
+
+	int done = 0;
+	do {
+		if (!done || !g_intr)
+			dtrace_sleep(dtp);	
+
+		if (done || g_intr) {
+			done = 1;
+		}
+
+		switch (dtrace_work_detached(dtp, stdout, &con, rx_topic)) {
+		case DTRACE_WORKSTATUS_DONE:
+			done = 1;
+			break;
+		case DTRACE_WORKSTATUS_OKAY:
+			break;
+		case DTRACE_WORKSTATUS_ERROR:
+		default:
+			if (dtrace_errno(dtp) != EINTR) 
+				DLOGTR2(PRIO_HIGH, "%s : %s", g_pname,
+				    dtrace_errmsg(dtp, dtrace_errno(dtp)));
+				done = 1;
+			break;
+		}
+
+	} while (!done);
+
+destroy_tx_kafka:
+	if (tx_topic_name != NULL) {	
+		/* Destroy the Kafka transmit topic */
+		rd_kafka_topic_destroy(tx_topic);
+
+		/* Destroy the Kafka transmit handle. */
+		DLOGTR1(PRIO_LOW, "%s: destroy kafka transmit handle\n",
+		    g_pname);
+		rd_kafka_destroy(tx_rk);
+	}
+
+destroy_dtrace:
+	/* Destroy dtrace the handle. */
+	DLOGTR1(PRIO_LOW, "%s: closing dtrace\n", g_pname);
+	dtrace_close(dtp);
+
+destroy_rx_kafka:
+	DLOGTR1(PRIO_LOW, "%s: destroy kafka receive topic\n", g_pname);
+
+	/* Destroy the Kafka receive topic */
+	rd_kafka_topic_destroy(rx_topic);
+
+	/* Destroy the Kafka recieve handle. */
+	DLOGTR1(PRIO_LOW, "%s: destroy kafka receive handle\n", g_pname);
+	rd_kafka_destroy(rx_rk);
+
+free_script_args:	
+	/* Free the memory used to hold the script arguments. */	
+	free(script_argv);
+
+	return ret;
 }
