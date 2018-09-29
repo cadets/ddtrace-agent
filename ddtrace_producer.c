@@ -36,9 +36,9 @@
 #include <dt_impl.h>
 #include <errno.h>
 #include <libgen.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
-#include <signal.h>
 #include <unistd.h>
 
 #include "dlog.h"
@@ -182,14 +182,15 @@ main(int argc, char *argv[])
 		ret = -1;
 		goto destroy_dtrace;
 	}
+#ifndef NDEBUG
 	fprintf(stdout, "%s: dtrace initialized\n", g_pname);
+#endif
 
-	//(void) dtrace_setopt(g_dtp, "aggsize", "4m");
-	(void) dtrace_setopt(g_dtp, "bufsize", "64m");
-	//(void) dtrace_setopt(g_dtp, "bufpolicy", "switch");
 	sprintf(konarg, "%d", dlog);
 	(void) dtrace_setopt(g_dtp, "konarg", konarg);
+#ifndef NDEBUG
 	printf("%s: dtrace options set\n", g_pname);
+#endif
 
 	dtrace_prog_t * prog;
 	dtrace_proginfo_t info;
@@ -202,7 +203,9 @@ main(int argc, char *argv[])
 		goto destroy_dtrace;
 		
 	}
+#ifndef NDEBUG
 	fprintf(stdout, "%s: dtrace program compiled\n", g_pname);
+#endif
 
 	if (dtrace_program_exec(g_dtp, prog, &info) == -1) {
 
@@ -210,7 +213,9 @@ main(int argc, char *argv[])
 		ret = -1;
 		goto destroy_dtrace;
 	}
+#ifndef NDEBUG
 	fprintf(stdout, "%s: dtrace probes enabled\n", g_pname);
+#endif
 
 	struct sigaction act;
 	(void) sigemptyset(&act.sa_mask);
@@ -227,7 +232,9 @@ main(int argc, char *argv[])
 		ret = -1;
 		goto destroy_dtrace;
 	}
+#ifndef NDEBUG
 	fprintf(stdout, "%s: dtrace instrumentation started...\n", g_pname);
+#endif
  
 	do {
 		if (!g_intr && !done) {
@@ -246,7 +253,9 @@ main(int argc, char *argv[])
 
 destroy_dtrace:
 	/* Destroy dtrace the handle. */
+#ifndef NDEBUG
 	fprintf(stdout, "%s: closing dtrace\n", g_pname);
+#endif
 	dtrace_close(g_dtp);
 
 destroy_nvlist:
@@ -255,7 +264,9 @@ destroy_nvlist:
 
 close_dlog:
 	/* Destroy dlog the handle. */
+#ifndef NDEBUG
 	fprintf(stdout, "%s: closing dlog\n", g_pname);
+#endif
 	close(dlog);
 
 	/* Close the DTrace script file handle. */	
