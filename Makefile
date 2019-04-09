@@ -37,7 +37,7 @@ MK_AUTO_OBJ:= yes
 PROGS= ddtrace_consumer ddtrace_producer ddtrace_producer_anon
 BINDIR= bin
 
-SRCS.ddtrace_consumer = ddtrace_consumer.c
+SRCS.ddtrace_consumer = ddtrace_consumer.c dl_bbuf.c
 MAN.ddtrace_consumer =
 
 SRCS.ddtrace_producer = ddtrace_producer.c
@@ -46,28 +46,34 @@ MAN.ddtrace_producer =
 SRCS.ddtrace_producer_anon = ddtrace_producer_anon.c
 MAN.ddtrace_producer_anon =
 
+LDADD+=-lm
+LDADD+=-lcrypto
 LDADD+=-ldtrace
 LDADD+=-lproc
 LDADD+=-lctf
 LDADD+=-lelf
 LDADD+=-lz
-LDADD+=-lrtld_db
+LDADD+=-lpthread
 LDADD+=-lrdkafka
-LDADD+=-lsbuf #?
+LDADD+=-lssl
+LDADD+=-lsbuf
+LDADD.ddtrace_consumer+=-lutil
 LDADD+=-lnv
 
-CFLAGS+=-DNDEBUG
+FREEBSD=/home/gcj21/cadets/src
+
 CFLAGS+=-DNEED_SOLARIS_BOOLEAN
+CFLAGS+=-Wunused-variable
 CFLAGS+=-L/usr/local/lib
 CFLAGS+=-I/usr/local/include
-CFLAGS+=-I/usr/src/cddl/compat/opensolaris/include
-CFLAGS+=-I/usr/src/cddl/contrib/opensolaris/lib/libdtrace/common
-CFLAGS+=-I/usr/src/cddl/contrib/opensolaris/lib/libctf/common
-CFLAGS+=-I/usr/src/cddl/lib/libdtrace
-CFLAGS+=-I/usr/src/sys/cddl/compat/opensolaris
-CFLAGS+=-I/usr/src/sys/cddl/contrib/opensolaris/uts/common
-CFLAGS+=-I/usr/src/sys
-CFLAGS+=-I/usr/src/sys/dev/dlog
+CFLAGS+=-I$(FREEBSD)/cddl/compat/opensolaris/include
+CFLAGS+=-I$(FREEBSD)/cddl/contrib/opensolaris/lib/libdtrace/common
+CFLAGS+=-I$(FREEBSD)/cddl/contrib/opensolaris/lib/libctf/common
+CFLAGS+=-I$(FREEBSD)/cddl/lib/libdtrace
+CFLAGS+=-I$(FREEBSD)/sys/cddl/compat/opensolaris
+CFLAGS+=-I$(FREEBSD)/sys/cddl/contrib/opensolaris/uts/common
+CFLAGS+=-I$(FREEBSD)/sys
+CFLAGS+=-I$(FREEBSD)/sys/dev/dlog
 CFLAGS+=-I../log-primitive/src
 CFLAGS+=-I../log-primitive/dlog
 
